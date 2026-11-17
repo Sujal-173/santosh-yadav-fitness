@@ -17,15 +17,16 @@ const ENV_KEYS = [
   'RAZORPAY_KEY_ID',
   'RAZORPAY_KEY_SECRET',
 ];
+const runtimeEnv = process.env as Record<string, string | undefined>;
 
 async function withEnv(
   values: Record<string, string | undefined>,
   run: () => void | Promise<void>,
 ): Promise<void> {
-  const previous = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
+  const previous = Object.fromEntries(ENV_KEYS.map((key) => [key, runtimeEnv[key]]));
   for (const [key, value] of Object.entries(values)) {
-    if (value === undefined) delete process.env[key];
-    else process.env[key] = value;
+    if (value === undefined) delete runtimeEnv[key];
+    else runtimeEnv[key] = value;
   }
 
   try {
@@ -33,8 +34,8 @@ async function withEnv(
   } finally {
     for (const key of ENV_KEYS) {
       const value = previous[key];
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
+      if (value === undefined) delete runtimeEnv[key];
+      else runtimeEnv[key] = value;
     }
   }
 }
@@ -95,7 +96,7 @@ test('simulated payments require explicit localhost development opt-in', async (
         /Razorpay credentials are required/,
       );
 
-      process.env.ENABLE_LOCAL_TEST_PAYMENT_SANDBOX = 'true';
+      runtimeEnv.ENABLE_LOCAL_TEST_PAYMENT_SANDBOX = 'true';
       assert.equal(isLocalTestPaymentSandboxEnabled(), true);
       const order = await createRazorpayOrder({
         amountPaise: 19900,
@@ -105,10 +106,10 @@ test('simulated payments require explicit localhost development opt-in', async (
       assert.equal(order.mode, 'test-sandbox');
       assert.match(order.razorpayOrderId, /^order_test_/);
 
-      process.env.NODE_ENV = 'production';
+      runtimeEnv.NODE_ENV = 'production';
       assert.equal(isLocalTestPaymentSandboxEnabled(), false);
-      process.env.NODE_ENV = 'development';
-      process.env.APP_URL = 'https://public.example';
+      runtimeEnv.NODE_ENV = 'development';
+      runtimeEnv.APP_URL = 'https://public.example';
       assert.equal(isLocalTestPaymentSandboxEnabled(), false);
     },
   );
@@ -133,7 +134,7 @@ test('payment signatures are rejected without a secret and bind the order ID', a
         verifyRazorpayPaymentSignature('order_test_2', 'pay_test_1', signature),
         false,
       );
-      process.env.ENABLE_LOCAL_TEST_PAYMENT_SANDBOX = 'false';
+      runtimeEnv.ENABLE_LOCAL_TEST_PAYMENT_SANDBOX = 'false';
       assert.equal(
         verifyRazorpayPaymentSignature('order_test_1', 'pay_test_1', signature),
         false,

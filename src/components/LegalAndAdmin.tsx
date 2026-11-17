@@ -281,20 +281,33 @@ export function AdminDashboardView({ onBackHome, onConfigUpdated }: AdminDashboa
   };
 
   const handleUploadPdf = async (productId: GoalSlug, file: File) => {
+    if (file.type !== 'application/pdf') {
+      setStatusNotice('Please select a valid PDF file.');
+      return;
+    }
+    if (file.size > 3 * 1024 * 1024) {
+      setStatusNotice('PDF must be 3 MB or smaller for secure Vercel upload.');
+      return;
+    }
     const reader = new FileReader();
+    reader.onerror = () => setStatusNotice('PDF could not be read. Please try again.');
     reader.onload = async () => {
       const base64Pdf = String(reader.result || '');
-      const res = await fetch(`/api/admin/products/${productId}/pdf`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ base64Pdf }),
-      });
-      if (res.ok) {
-        setStatusNotice(`New PDF uploaded securely for ${productId}.`);
-        await loadOverview();
-      } else {
-        const data = await res.json();
-        setStatusNotice(data.error || 'PDF upload failed.');
+      try {
+        const res = await fetch(`/api/admin/products/${productId}/pdf`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ base64Pdf }),
+        });
+        if (res.ok) {
+          setStatusNotice(`New PDF uploaded securely for ${productId}.`);
+          await loadOverview();
+        } else {
+          const data = await res.json();
+          setStatusNotice(data.error || 'PDF upload failed.');
+        }
+      } catch {
+        setStatusNotice('PDF upload request failed. Check your connection and try again.');
       }
     };
     reader.readAsDataURL(file);
@@ -1185,8 +1198,8 @@ function GoogleSheetsAdminPanel({
             <span className="text-amber-300 font-semibold">Not configured</span>
           )}{' '}
           — This panel saves only the Sheet ID and tab name. Set the service-account email and private
-          key, or the Apps Script webhook URL, in the backend <code>.env</code>; restart the backend
-          after changing those values. Secrets are not stored in MongoDB.
+          key, or the Apps Script webhook URL, in Vercel Project Settings → Environment Variables,
+          then redeploy. Secrets are not stored in MongoDB.
         </div>
 
         <div className="space-y-3.5">
@@ -1237,8 +1250,8 @@ function GoogleSheetsAdminPanel({
             Option B — Google Apps Script Webhook (Easiest Zero-GCP Setup)
           </h3>
           <p className="text-xs text-[#BDB5AD] leading-relaxed">
-            Set <code>GOOGLE_APPS_SCRIPT_WEBHOOK_URL</code> in the backend environment instead of
-            entering it here. Restart the backend after changing the URL.
+            Set <code>GOOGLE_APPS_SCRIPT_WEBHOOK_URL</code> in Vercel Environment Variables instead of
+            entering it here. Redeploy after changing the URL.
           </p>
           <p className="text-xs text-[#BDB5AD] leading-relaxed">
             Lead records use the configured tab. Payment rows are upserted into a separate{' '}
@@ -1286,7 +1299,7 @@ function GoogleSheetsAdminPanel({
             <strong>Deploy → New deployment → Web app</strong> select karo (Who has access:{' '}
             <strong>Anyone</strong>).
           </li>
-          <li>Web app URL ko backend <code>.env</code> mein <code>GOOGLE_APPS_SCRIPT_WEBHOOK_URL</code> ke naam se set karke server restart karo.</li>
+          <li>Web app URL ko Vercel Environment Variables mein <code>GOOGLE_APPS_SCRIPT_WEBHOOK_URL</code> ke naam se set karke redeploy karo.</li>
         </ol>
 
         <div className="relative">

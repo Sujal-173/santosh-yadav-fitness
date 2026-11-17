@@ -1,9 +1,7 @@
 import 'dotenv/config';
 import 'express-async-errors';
 import crypto from 'node:crypto';
-import path from 'node:path';
 import express, { type Request, type Response, type NextFunction } from 'express';
-import { createServer as createViteServer } from 'vite';
 import { z } from 'zod';
 import {
   clearAdminSessionCookie,
@@ -16,7 +14,7 @@ import {
   requireAdmin,
   setAdminSessionCookie,
 } from './server/authService';
-import { getOrCreatePrivatePdf, saveUploadedPrivatePdf } from './server/pdfService';
+import { getOrCreatePrivatePdf, saveUploadedPrivatePdf, isPrivatePdfReady } from './server/pdfService';
 import {
   hasVerifiedCapturedPayment,
   isVerifiedCapturedPayment,
@@ -30,7 +28,7 @@ import {
   verifyRazorpayPaymentSignature,
   verifyRazorpayWebhookSignature,
 } from './server/razorpayService';
-import { connectInfrastructure, infrastructureHealth, getRedis, closeInfrastructure } from './server/database';
+import { connectInfrastructure, infrastructureHealth, getRedis } from './server/database';
 import {
   initializeStore, getStorePersistenceError,
   appendAuditLog,
@@ -50,8 +48,7 @@ import {
   testGoogleSheetConnection,
 } from './server/sheetsService';
 
-const PORT = Number(process.env.PORT || 3000);
-const isProduction = process.env.NODE_ENV === 'production';
+const isProduction = process.env.VERCEL_ENV === 'production' || (process.env.NODE_ENV === 'production' && !process.env.VERCEL_ENV);
 
 async function syncPaymentSheetRow(
   order: OrderRecord,
@@ -90,7 +87,7 @@ function validateEnvironment(): void {
     if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${key} must be a positive integer in paise`);
   }
   if (isProduction) {
-    const productionRequired = ['APP_URL', 'RAZORPAY_KEY_ID', 'RAZORPAY_KEY_SECRET', 'RAZORPAY_WEBHOOK_SECRET'];
+    const productionRequired = ['APP_URL', 'RAZORPAY_KEY_ID', 'RAZORPAY_KEY_SECRET', 'RAZORPAY_WEBHOOK_SECRET', 'BLOB_READ_WRITE_TOKEN'];
     const missingProduction = productionRequired.filter((key) => !process.env[key]?.trim());
     if (missingProduction.length) throw new Error(`Missing production secrets/config: ${missingProduction.join(', ')}`);
     if (!process.env.APP_URL!.startsWith('https://')) throw new Error('APP_URL must use HTTPS in production');
@@ -214,7 +211,7 @@ async function issueDownloadToken(orderId: string, productId: GoalSlug): Promise
   return rawToken;
 }
 
-async function startServer() {
+export async function createApiApp() {
   validateEnvironment();
   await connectInfrastructure();
   await initializeStore();
@@ -230,6 +227,52 @@ async function startServer() {
       res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
     }
     next();
+  });
+
+  // The legacy store is a single MongoDB snapshot. Serialize API requests across
+  // Vercel instances with Redis and refresh the snapshot on every invocation so
+  // warm function memory never becomes the source of truth.
+  app.use(async (_req, res, next) => {
+    const redis = getRedis();
+    const lockKey = 'syf:store:request-lock';
+    const lockToken = crypto.randomUUID();
+    let locked = false;
+    try {
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        const result = await redis.set(lockKey, lockToken, { NX: true, PX: 65000 });
+        if (result === 'OK') { locked = true; break; }
+        await new Promise((resolve) => setTimeout(resolve, 75));
+      }
+      if (!locked) {
+        res.status(503).json({ error: 'Server is busy processing another request. Please retry shortly.' });
+        return;
+      }
+      await initializeStore();
+      res.once('finish', () => {
+        void redis.eval(
+          "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+          { keys: [lockKey], arguments: [lockToken] },
+        ).catch((error) => console.error('Could not release request lock:', error));
+      });
+      res.once('close', () => {
+        if (!res.writableEnded) {
+          void redis.eval(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+            { keys: [lockKey], arguments: [lockToken] },
+          ).catch((error) => console.error('Could not release request lock:', error));
+        }
+      });
+      next();
+    } catch (error) {
+      if (locked) {
+        await redis.eval(
+          "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+          { keys: [lockKey], arguments: [lockToken] },
+        ).catch(() => undefined);
+      }
+      console.error('Request initialization failed:', error);
+      res.status(503).json({ error: 'Backend dependencies are unavailable. Check MongoDB and Redis configuration.' });
+    }
   });
 
   // Razorpay Webhook MUST receive raw Buffer BEFORE express.json()
@@ -503,6 +546,17 @@ async function startServer() {
     const product = store.products[parsed.data.goal];
     if (!product || !product.active) {
       res.status(400).json({ error: 'Selected diet plan abhi available nahi hai.' });
+      return;
+    }
+
+    try {
+      if (!(await isPrivatePdfReady(product.pdfFilename))) {
+        res.status(503).json({ error: 'This diet plan PDF is not uploaded yet. Please contact support or try again later.' });
+        return;
+      }
+    } catch (error) {
+      console.error('Private PDF readiness check failed:', error);
+      res.status(503).json({ error: 'Diet plan download storage is unavailable. Please try again later.' });
       return;
     }
 
@@ -878,7 +932,7 @@ async function startServer() {
     tokenRecord.downloadCount += 1;
     await saveStore(store);
 
-    const pdfBuffer = getOrCreatePrivatePdf(product.id, product.pdfFilename);
+    const pdfBuffer = await getOrCreatePrivatePdf(product.id, product.pdfFilename);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader(
       'Content-Disposition',
@@ -1021,7 +1075,11 @@ async function startServer() {
       return;
     }
 
-    saveUploadedPrivatePdf(product.pdfFilename, buffer);
+    if (buffer.length > 3 * 1024 * 1024) {
+      res.status(413).json({ error: 'PDF must be 3 MB or smaller for Vercel upload limits.' });
+      return;
+    }
+    await saveUploadedPrivatePdf(product.pdfFilename, buffer);
     product.updatedAt = new Date().toISOString();
 
     const actor = (req as Request & { adminEmail?: string }).adminEmail || 'admin';
@@ -1229,34 +1287,6 @@ async function startServer() {
     res.status(500).json({ error: 'Internal server error. Please retry or contact support.' });
   });
 
-  // Frontend middleware (Vite in dev, static dist in prod)
-  if (!isProduction) {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distDir = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
-    });
-  }
-
-  const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Santosh Yadav Fitness server listening on http://0.0.0.0:${PORT}`);
-  });
-  const shutdown = async () => {
-    server.close();
-    await closeInfrastructure();
-    process.exit(0);
-  };
-  process.once('SIGINT', shutdown);
-  process.once('SIGTERM', shutdown);
+  // Next.js owns all page rendering. This function only constructs the API app.
+  return app;
 }
-
-startServer().catch((err) => {
-  console.error('Fatal server startup error:', err);
-  process.exit(1);
-});

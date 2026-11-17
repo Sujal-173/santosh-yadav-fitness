@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { GoalSlug } from './store';
+import { get, put } from '@vercel/blob';
 
 const PRIVATE_PDF_DIR = path.resolve(process.cwd(), 'private-pdfs');
 
@@ -179,21 +180,77 @@ function buildGoalPdfBuffer(goal: GoalSlug): Buffer {
   return assemblePdf([p1.join('\n'), p2.join('\n')]);
 }
 
-export function getOrCreatePrivatePdf(goal: GoalSlug, filename: string): Buffer {
-  ensurePrivateDir();
-  const safeName = path.basename(filename);
-  const fullPath = path.join(PRIVATE_PDF_DIR, safeName);
-  if (fs.existsSync(fullPath)) {
-    return fs.readFileSync(fullPath);
+async function streamToBuffer(stream: ReadableStream<Uint8Array>): Promise<Buffer> {
+  const reader = stream.getReader();
+  const chunks: Buffer[] = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) chunks.push(Buffer.from(value));
   }
+  return Buffer.concat(chunks);
+}
+
+export async function isPrivatePdfReady(filename: string): Promise<boolean> {
+  const safeName = path.basename(filename);
+  if (process.env.BLOB_READ_WRITE_TOKEN) {
+    const existing = await get(safeName, { access: 'private' });
+    if (!existing || existing.statusCode !== 200) return false;
+    // The readiness check only needs metadata. Cancel the response stream instead
+    // of leaving an unread Blob stream open in a warm serverless invocation.
+    await existing.stream?.cancel().catch(() => undefined);
+    return true;
+  }
+  if (process.env.NODE_ENV === 'production') return false;
+  ensurePrivateDir();
+  return true;
+}
+
+export async function getOrCreatePrivatePdf(goal: GoalSlug, filename: string): Promise<Buffer> {
+  const safeName = path.basename(filename);
+  if (process.env.BLOB_READ_WRITE_TOKEN) {
+    const existing = await get(safeName, { access: 'private' });
+    if (existing && existing.statusCode === 200 && existing.stream) {
+      return streamToBuffer(existing.stream);
+    }
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(`Approved PDF is missing from private Blob storage: ${safeName}. Upload it in Admin before accepting orders.`);
+    }
+    const generated = buildGoalPdfBuffer(goal);
+    await put(safeName, generated, {
+      access: 'private',
+      addRandomSuffix: false,
+      allowOverwrite: true,
+      contentType: 'application/pdf',
+    });
+    return generated;
+  }
+
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('BLOB_READ_WRITE_TOKEN is required for private PDF storage on Vercel.');
+  }
+  ensurePrivateDir();
+  const fullPath = path.join(PRIVATE_PDF_DIR, safeName);
+  if (fs.existsSync(fullPath)) return fs.readFileSync(fullPath);
   const generated = buildGoalPdfBuffer(goal);
   fs.writeFileSync(fullPath, generated);
   return generated;
 }
 
-export function saveUploadedPrivatePdf(filename: string, data: Buffer): void {
-  ensurePrivateDir();
+export async function saveUploadedPrivatePdf(filename: string, data: Buffer): Promise<void> {
   const safeName = path.basename(filename);
-  const fullPath = path.join(PRIVATE_PDF_DIR, safeName);
-  fs.writeFileSync(fullPath, data);
+  if (process.env.BLOB_READ_WRITE_TOKEN) {
+    await put(safeName, data, {
+      access: 'private',
+      addRandomSuffix: false,
+      allowOverwrite: true,
+      contentType: 'application/pdf',
+    });
+    return;
+  }
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('BLOB_READ_WRITE_TOKEN is required for private PDF storage on Vercel.');
+  }
+  ensurePrivateDir();
+  fs.writeFileSync(path.join(PRIVATE_PDF_DIR, safeName), data);
 }

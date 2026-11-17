@@ -7,3 +7,8 @@ coverage/
 .env*
 !.env.example
 private-pdfs/
+
+.next/
+.vercel/
+out/
+*.tsbuildinfo
