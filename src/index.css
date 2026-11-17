@@ -1,0 +1,23 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Barlow Condensed", sans-serif;
+  --font-sans: "DM Sans", sans-serif;
+}
+
+:root {
+  --syf-bg-primary: #0b0d0e;
+  --syf-bg-secondary: #141719;
+  --syf-accent: #f47716;
+  --syf-accent-hover: #ff9a32;
+  --syf-cream: #f5ebdd;
+  --syf-text-light: #f7f4ef;
+  --syf-text-dark: #211a15;
+  --syf-text-muted: #a6a09a;
+}
+
+@layer base {
+  body {
+    font-family: var(--font-sans);
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Santosh Yadav Fitness",
+  "description": "Simple, practical Indian diet plans for Fat Loss and Weight Gain by Santosh Yadav Fitness.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
