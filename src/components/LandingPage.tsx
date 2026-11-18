@@ -1090,6 +1090,18 @@ export function LandingPage({
           <div className="text-xs text-[#8C857E]">
             © {new Date().getFullYear()} Santosh Yadav Fitness. All rights reserved.
           </div>
+          <p className="text-[11px] sm:text-xs text-[#8C857E]">
+  Designed &amp; Developed by{" "}
+  <a
+    href="https://aventracreative.in/"
+    target="_blank"
+    rel="noopener noreferrer"
+    className="font-semibold text-[#F47716] hover:text-white transition-colors underline-offset-4 hover:underline"
+  >
+    Sujal Patidar (Aventra Creative)
+  </a>
+  {" "}· Indore
+</p>
 
           <p className="max-w-3xl mx-auto text-[11px] text-[#7D7771] leading-relaxed">
             <strong>Nutrition Disclaimer:</strong> Yeh goal-based diet plan sirf general fitness aur
