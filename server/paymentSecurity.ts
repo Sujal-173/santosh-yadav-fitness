@@ -4,17 +4,32 @@ export function isVerifiedCapturedPayment(
   order: OrderRecord,
   payment: PaymentRecord,
 ): boolean {
-  return (
-    order.paymentStatus === 'paid' &&
-    Boolean(payment.razorpayPaymentId) &&
-    Boolean(payment.razorpayOrderId) &&
-    payment.orderId === order.id &&
-    payment.razorpayOrderId === order.razorpayOrderId &&
-    payment.amountPaise === order.amountPaise &&
-    payment.currency === 'INR' &&
-    payment.status === 'captured' &&
-    payment.captured &&
-    payment.signatureVerified
+  if (
+    order.paymentStatus !== 'paid' ||
+    payment.orderId !== order.id ||
+    payment.amountPaise !== order.amountPaise ||
+    payment.currency !== 'INR' ||
+    payment.status !== 'captured' ||
+    !payment.captured
+  ) {
+    return false;
+  }
+
+  if (order.gateway === 'upi_auto') {
+    return Boolean(
+      payment.gateway === 'upi_auto' &&
+      payment.gatewayOrderId === order.gatewayOrderId &&
+      payment.upiTransactionId &&
+      payment.gatewayVerified,
+    );
+  }
+
+  // Compatibility for existing verified Razorpay orders; no new Razorpay payments are accepted.
+  return Boolean(
+    payment.signatureVerified &&
+    payment.razorpayPaymentId &&
+    payment.razorpayOrderId &&
+    payment.razorpayOrderId === order.razorpayOrderId,
   );
 }
 

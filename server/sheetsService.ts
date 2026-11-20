@@ -35,8 +35,8 @@ const LEAD_HEADERS = [
 const LEAD_COLUMN_WIDTHS = [210, 170, 150, 130, 210, 120, 70, 105, 115, 115, 165, 125, 140];
 const PAYMENT_HEADERS = [
   'Order ID',
-  'Razorpay Order ID',
-  'Payment ID',
+  'Gateway Order ID',
+  'Transaction ID',
   'Buyer Name',
   'Mobile Number',
   'Email',
@@ -112,8 +112,10 @@ function paymentSheetRow(order: OrderRecord, payments: PaymentRecord[]): Array<s
 
   return [
     order.id,
-    order.razorpayOrderId,
-    latestPayment?.status === 'reported_failed' ? '' : latestPayment?.razorpayPaymentId || '',
+    order.gatewayOrderId || order.razorpayOrderId || '',
+    latestPayment?.status === 'reported_failed'
+      ? ''
+      : latestPayment?.upiTransactionId || latestPayment?.razorpayPaymentId || '',
     order.customerName,
     order.customerPhone,
     order.customerEmail || '',

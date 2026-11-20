@@ -14,20 +14,15 @@ import {
   requireAdmin,
   setAdminSessionCookie,
 } from './server/authService';
-import { getOrCreatePrivatePdf, saveUploadedPrivatePdf, isPrivatePdfReady } from './server/pdfService';
+import { getOrCreatePrivatePdf } from './server/pdfService';
+import { hasVerifiedCapturedPayment } from './server/paymentSecurity';
+import { normalizeOrderId } from './server/orderId';
 import {
-  hasVerifiedCapturedPayment,
-  isVerifiedCapturedPayment,
-} from './server/paymentSecurity';
-import {
-  createRazorpayOrder,
-  createSignatureForOrderPayment,
-  getRazorpayPublicConfig,
-  isLocalTestPaymentSandboxEnabled,
-  verifyCapturedStatusWithRazorpay,
-  verifyRazorpayPaymentSignature,
-  verifyRazorpayWebhookSignature,
-} from './server/razorpayService';
+  createUpiIntent,
+  getPaytmTransactionStatus,
+  getUpiAutoSettings,
+  isUpiAutoConfigured,
+} from './server/upiAutoService';
 import { connectInfrastructure, infrastructureHealth, getRedis } from './server/database';
 import {
   initializeStore, getStorePersistenceError,
@@ -61,37 +56,19 @@ async function syncPaymentSheetRow(
   }
 }
 
-function isLoopbackRequest(req: Request): boolean {
-  const remoteAddress = req.socket.remoteAddress?.toLowerCase();
-  return (
-    remoteAddress === '::1' ||
-    remoteAddress === '127.0.0.1' ||
-    remoteAddress === '::ffff:127.0.0.1'
-  );
-}
-
 function validateEnvironment(): void {
-  const required = ['MONGODB_URI', 'MONGODB_DB_NAME', 'MONGODB_STORE_COLLECTION', 'REDIS_URL', 'ADMIN_EMAIL', 'ADMIN_PASSWORD_HASH', 'BRAND_NAME', 'WHATSAPP_NUMBER', 'SUPPORT_EMAIL', 'PRODUCT_FATLOSS_NAME', 'PRODUCT_WEIGHT_GAIN_NAME', 'PRODUCT_FATLOSS_DESCRIPTION', 'PRODUCT_WEIGHT_GAIN_DESCRIPTION', 'PRODUCT_FATLOSS_PDF_FILENAME', 'PRODUCT_WEIGHT_GAIN_PDF_FILENAME'];
+  const required = ['MONGODB_URI', 'MONGODB_DB_NAME', 'MONGODB_STORE_COLLECTION', 'REDIS_URL', 'ADMIN_EMAIL', 'ADMIN_PASSWORD_HASH', 'BRAND_NAME', 'WHATSAPP_NUMBER', 'SUPPORT_EMAIL', 'PRODUCT_FATLOSS_NAME', 'PRODUCT_WEIGHT_GAIN_NAME', 'PRODUCT_FATLOSS_DESCRIPTION', 'PRODUCT_WEIGHT_GAIN_DESCRIPTION'];
   const missing = required.filter((key) => !process.env[key]?.trim());
   if (missing.length) throw new Error(`Missing required .env values: ${missing.join(', ')}`);
-  if (
-    process.env.ENABLE_LOCAL_TEST_PAYMENT_SANDBOX === 'true' &&
-    !isLocalTestPaymentSandboxEnabled()
-  ) {
-    throw new Error(
-      'ENABLE_LOCAL_TEST_PAYMENT_SANDBOX is only allowed in development with APP_URL on localhost.',
-    );
-  }
   for (const key of ['PRODUCT_FATLOSS_PRICE_PAISE', 'PRODUCT_WEIGHT_GAIN_PRICE_PAISE']) {
     const value = Number(process.env[key]);
     if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${key} must be a positive integer in paise`);
   }
   if (isProduction) {
-    const productionRequired = ['APP_URL', 'RAZORPAY_KEY_ID', 'RAZORPAY_KEY_SECRET', 'RAZORPAY_WEBHOOK_SECRET', 'BLOB_READ_WRITE_TOKEN'];
+    const productionRequired = ['APP_URL'];
     const missingProduction = productionRequired.filter((key) => !process.env[key]?.trim());
     if (missingProduction.length) throw new Error(`Missing production secrets/config: ${missingProduction.join(', ')}`);
     if (!process.env.APP_URL!.startsWith('https://')) throw new Error('APP_URL must use HTTPS in production');
-    if (!process.env.RAZORPAY_KEY_ID!.startsWith('rzp_live_')) throw new Error('Production requires an rzp_live_ key');
     if (!process.env.MONGODB_URI!.includes('tls=true') && !process.env.MONGODB_URI!.includes('mongodb+srv://')) throw new Error('Production MongoDB URI must use TLS');
     if (!process.env.REDIS_URL!.startsWith('rediss://')) throw new Error('Production Redis URL must use TLS (rediss://)');
   }
@@ -164,14 +141,6 @@ const CreateOrderSchema = z.object({
     message: 'Order & PDF delivery consent zaroori hai.',
   }),
   source: z.string().max(160).optional(),
-});
-
-const VerifyPaymentSchema = z.object({
-  orderId: z.string().min(4),
-  razorpayOrderId: z.string().min(4),
-  razorpayPaymentId: z.string().min(4),
-  razorpaySignature: z.string().min(10),
-  method: z.string().max(40).optional(),
 });
 
 const RecoverSchema = z.object({
@@ -275,153 +244,6 @@ export async function createApiApp() {
     }
   });
 
-  // Razorpay Webhook MUST receive raw Buffer BEFORE express.json()
-  app.post(
-    '/api/webhooks/razorpay',
-    express.raw({ type: 'application/json', limit: '256kb' }),
-    async (req, res) => {
-      const signature = String(req.headers['x-razorpay-signature'] || '');
-      const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from('');
-
-      if (!verifyRazorpayWebhookSignature(rawBody, signature)) {
-        res.status(400).json({ error: 'Invalid webhook signature' });
-        return;
-      }
-
-      let payload: {
-        event?: string;
-        payload?: {
-          payment?: {
-            entity?: {
-              id?: string;
-              order_id?: string;
-              amount?: number;
-              currency?: string;
-              method?: string;
-              status?: string;
-            };
-          };
-        };
-      };
-
-      try {
-        payload = JSON.parse(rawBody.toString('utf8'));
-      } catch {
-        res.status(400).json({ error: 'Malformed JSON body' });
-        return;
-      }
-
-      const eventId = String(
-        req.headers['x-razorpay-event-id'] ||
-          crypto.createHash('sha256').update(rawBody).digest('hex'),
-      );
-
-      const store = loadStore();
-      if (store.processedWebhookEvents.includes(eventId)) {
-        res.json({ status: 'already_processed' });
-        return;
-      }
-
-      const eventName = payload.event || '';
-      const paymentEntity = payload.payload?.payment?.entity;
-      const rzpOrderId = paymentEntity?.order_id;
-      const rzpPaymentId = paymentEntity?.id;
-      let orderToSync: OrderRecord | undefined;
-
-      if (rzpOrderId) {
-        const order = store.orders.find((o) => o.razorpayOrderId === rzpOrderId);
-        if (order) {
-          const existingPayment = rzpPaymentId
-            ? store.payments.find((payment) => payment.razorpayPaymentId === rzpPaymentId)
-            : undefined;
-          const paymentBelongsToOrder =
-            !existingPayment || existingPayment.orderId === order.id;
-
-          if (eventName === 'payment.captured' || eventName === 'order.paid') {
-            if (
-              rzpPaymentId &&
-              paymentBelongsToOrder &&
-              paymentEntity?.amount === order.amountPaise &&
-              paymentEntity.currency === 'INR'
-            ) {
-              order.paymentStatus = 'paid';
-              order.orderStatus = 'completed';
-              order.paidAt = order.paidAt || new Date().toISOString();
-
-              if (existingPayment) {
-                existingPayment.razorpayOrderId = rzpOrderId;
-                existingPayment.orderId = order.id;
-                existingPayment.amountPaise = order.amountPaise;
-                existingPayment.currency = 'INR';
-                existingPayment.method = paymentEntity.method || 'razorpay';
-                existingPayment.status = 'captured';
-                existingPayment.captured = true;
-                existingPayment.signatureVerified = true;
-                existingPayment.webhookEventId = eventId;
-              } else {
-                store.payments.unshift({
-                  id: generateId('pay'),
-                  razorpayPaymentId: rzpPaymentId,
-                  razorpayOrderId: rzpOrderId,
-                  orderId: order.id,
-                  amountPaise: order.amountPaise,
-                  currency: 'INR',
-                  method: paymentEntity.method || 'razorpay',
-                  status: 'captured',
-                  captured: true,
-                  signatureVerified: true,
-                  webhookEventId: eventId,
-                  createdAt: new Date().toISOString(),
-                });
-              }
-
-              const lead = store.leads.find((l) => l.phone === order.customerPhone);
-              if (lead) lead.purchased = true;
-              orderToSync = order;
-            }
-          } else if (
-            eventName === 'payment.failed' &&
-            order.paymentStatus !== 'paid' &&
-            rzpPaymentId &&
-            paymentBelongsToOrder &&
-            !existingPayment?.captured &&
-            paymentEntity?.amount === order.amountPaise &&
-            paymentEntity.currency === 'INR'
-          ) {
-            order.paymentStatus = 'failed';
-            order.orderStatus = 'failed';
-            if (existingPayment) {
-              existingPayment.status = 'failed';
-              existingPayment.captured = false;
-              existingPayment.signatureVerified = true;
-              existingPayment.webhookEventId = eventId;
-            } else {
-              store.payments.unshift({
-                id: generateId('pay'), razorpayPaymentId: rzpPaymentId,
-                razorpayOrderId: rzpOrderId, orderId: order.id,
-                amountPaise: order.amountPaise, currency: 'INR',
-                method: paymentEntity?.method || 'unknown', status: 'failed', captured: false,
-                signatureVerified: true, webhookEventId: eventId, createdAt: new Date().toISOString(),
-              });
-            }
-            orderToSync = order;
-          }
-        }
-      }
-
-      store.processedWebhookEvents.unshift(eventId);
-      if (store.processedWebhookEvents.length > 500) {
-        store.processedWebhookEvents.length = 500;
-      }
-      await saveStore(store);
-      if (orderToSync) {
-        await syncPaymentSheetRow(orderToSync, store.payments, store.siteConfig);
-      }
-
-      res.json({ status: 'ok' });
-    },
-  );
-
   app.use(express.json({ limit: '5mb' }));
 
   // SEO: robots.txt & sitemap.xml
@@ -459,22 +281,19 @@ export async function createApiApp() {
     }
   });
 
-  // Public Configuration & Products (authoritative pricing from backend; strip private keys)
+  // Public Configuration & Products. Only the payment VPA is public; the Paytm MID stays server-side.
   app.get('/api/config', (_req, res) => {
     const store = loadStore();
-    const rzp = getRazorpayPublicConfig();
-    const { googleSheets: _hiddenSheets, ...publicSiteConfig } = store.siteConfig;
+    const upiSettings = getUpiAutoSettings(store.siteConfig);
+    const { googleSheets: _hiddenSheets, upiAuto: _hiddenUpiAuto, ...publicSiteConfig } = store.siteConfig;
 
     res.json({
       siteConfig: publicSiteConfig,
       products: Object.values(store.products),
-      razorpay: {
-        keyId: rzp.keyId,
-        mode: rzp.isConfigured
-          ? 'razorpay'
-          : isLocalTestPaymentSandboxEnabled()
-            ? 'test-sandbox'
-            : 'unconfigured',
+      upiAuto: {
+        configured: isUpiAutoConfigured(upiSettings),
+        upiId: isUpiAutoConfigured(upiSettings) ? upiSettings.upiId : null,
+        expiryMinutes: upiSettings.expiryMinutes,
       },
     });
   });
@@ -525,7 +344,7 @@ export async function createApiApp() {
     });
   });
 
-  // Create Razorpay Order (Authoritative price from DB)
+  // Create a UPI Auto order: QR + UPI deep links are generated from the authoritative product price.
   app.post('/api/orders', rateLimit('orders', 15, 60_000), async (req, res) => {
     const parsed = CreateOrderSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -549,214 +368,185 @@ export async function createApiApp() {
       return;
     }
 
-    try {
-      if (!(await isPrivatePdfReady(product.pdfFilename))) {
-        res.status(503).json({ error: 'This diet plan PDF is not uploaded yet. Please contact support or try again later.' });
-        return;
-      }
-    } catch (error) {
-      console.error('Private PDF readiness check failed:', error);
-      res.status(503).json({ error: 'Diet plan download storage is unavailable. Please try again later.' });
-      return;
-    }
-
-    const rzpConfig = getRazorpayPublicConfig();
-    if (!rzpConfig.isConfigured && !isLocalTestPaymentSandboxEnabled()) {
+    const upiSettings = getUpiAutoSettings(store.siteConfig);
+    if (!isUpiAutoConfigured(upiSettings)) {
       res.status(503).json({
-        error: 'Payment gateway abhi configure nahi hai. Kripya baad mein try karein.',
+        error: 'UPI Auto payment abhi admin panel mein configure nahi hai. Please contact support.',
       });
-      return;
-    }
-
-    if (
-      isLocalTestPaymentSandboxEnabled() &&
-      !rzpConfig.isConfigured &&
-      !isLoopbackRequest(req)
-    ) {
-      res.status(403).json({ error: 'The test payment sandbox is only available locally.' });
       return;
     }
 
     const orderId = `SYF${crypto.randomBytes(12).toString('hex').toUpperCase()}`;
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + upiSettings.expiryMinutes * 60_000).toISOString();
+    const intent = createUpiIntent({
+      upiId: upiSettings.upiId,
+      amountPaise: product.pricePaise,
+      payeeName: store.siteConfig.brandName || 'Santosh Yadav Fitness',
+      orderId,
+      purpose: `Diet Plan ${product.id === 'fatloss' ? 'Fat Loss' : 'Weight Gain'} ${orderId}`,
+    });
 
-    try {
-      const { razorpayOrderId, mode } = await createRazorpayOrder({
-        amountPaise: product.pricePaise,
-        receipt: orderId,
-        notes: {
-          orderId,
-          goal: product.id,
-          phone: parsed.data.phone,
-        },
-      });
+    const order: OrderRecord = {
+      id: orderId,
+      customerName: parsed.data.name,
+      customerPhone: parsed.data.phone,
+      customerEmail: parsed.data.email || undefined,
+      age: parsed.data.age,
+      gender: parsed.data.gender,
+      heightCm: parsed.data.heightCm,
+      weightKg: parsed.data.weightKg,
+      dietPreference: parsed.data.dietPreference,
+      productId: product.id,
+      productName: product.name,
+      gateway: 'upi_auto',
+      gatewayOrderId: orderId,
+      gatewayMerchantId: upiSettings.merchantId,
+      amountPaise: product.pricePaise,
+      currency: 'INR',
+      paymentStatus: 'pending',
+      orderStatus: 'created',
+      expiresAt,
+      createdAt: now.toISOString(),
+    };
 
-      store.orders.unshift({
-        id: orderId,
-        customerName: parsed.data.name,
-        customerPhone: parsed.data.phone,
-        customerEmail: parsed.data.email || undefined,
+    store.orders.unshift(order);
+
+    // Record or update lead & sync to Google Sheets.
+    const existingLead = store.leads.find(
+      (l) => l.phone === parsed.data.phone && l.goal === product.id,
+    );
+    if (!existingLead) {
+      const newLead: LeadRecord = {
+        id: generateId('lead'),
+        name: parsed.data.name,
+        phone: parsed.data.phone,
+        email: parsed.data.email || undefined,
+        goal: product.id,
         age: parsed.data.age,
         gender: parsed.data.gender,
         heightCm: parsed.data.heightCm,
         weightKg: parsed.data.weightKg,
         dietPreference: parsed.data.dietPreference,
-        productId: product.id,
-        productName: product.name,
-        razorpayOrderId,
-        amountPaise: product.pricePaise,
-        currency: 'INR',
-        paymentStatus: 'pending',
-        orderStatus: 'created',
-        createdAt: new Date().toISOString(),
-      });
-
-      // Record or update lead & sync to Google Sheets
-      const existingLead = store.leads.find(
-        (l) => l.phone === parsed.data.phone && l.goal === product.id,
-      );
-      if (!existingLead) {
-        const newLead: LeadRecord = {
-          id: generateId('lead'),
-          name: parsed.data.name,
-          phone: parsed.data.phone,
-          email: parsed.data.email || undefined,
-          goal: product.id,
-          age: parsed.data.age,
-          gender: parsed.data.gender,
-          heightCm: parsed.data.heightCm,
-          weightKg: parsed.data.weightKg,
-          dietPreference: parsed.data.dietPreference,
-          consentAccepted: parsed.data.consentAccepted,
-          source: parsed.data.source || 'checkout',
-          purchased: false,
-          sheetSynced: false,
-          createdAt: new Date().toISOString(),
-        };
-        const syncResult = await appendLeadToGoogleSheet(newLead, store.siteConfig);
-        if (syncResult.synced) {
-          newLead.sheetSynced = true;
-          newLead.sheetSyncedAt = new Date().toISOString();
-        } else if (syncResult.error) {
-          newLead.sheetSyncError = syncResult.error;
-        }
-        store.leads.unshift(newLead);
+        consentAccepted: parsed.data.consentAccepted,
+        source: parsed.data.source || 'checkout',
+        purchased: false,
+        sheetSynced: false,
+        createdAt: now.toISOString(),
+      };
+      const syncResult = await appendLeadToGoogleSheet(newLead, store.siteConfig);
+      if (syncResult.synced) {
+        newLead.sheetSynced = true;
+        newLead.sheetSyncedAt = new Date().toISOString();
+      } else if (syncResult.error) {
+        newLead.sheetSyncError = syncResult.error;
       }
-
-      await saveStore(store);
-      const createdOrder = store.orders.find((order) => order.id === orderId);
-      if (createdOrder) {
-        await syncPaymentSheetRow(createdOrder, store.payments, store.siteConfig);
-      }
-
-      const rzp = getRazorpayPublicConfig();
-      res.status(201).json({
-        orderId,
-        razorpayOrderId,
-        amountPaise: product.pricePaise,
-        currency: 'INR',
-        productName: product.name,
-        keyId: rzp.keyId,
-        mode,
-      });
-    } catch (err) {
-      console.error('Order creation error:', err);
-      res.status(502).json({
-        error: 'Payment order create karne mein problem aayi. Dobara try karein.',
-      });
+      store.leads.unshift(newLead);
     }
+
+    await saveStore(store);
+    await syncPaymentSheetRow(order, store.payments, store.siteConfig);
+
+    res.status(201).json({
+      orderId,
+      amountPaise: product.pricePaise,
+      currency: 'INR',
+      productName: product.name,
+      upiUri: intent.upiUri,
+      qrCodeUrl: intent.qrCodeUrl,
+      upiId: upiSettings.upiId,
+      appLinks: intent.appLinks,
+      expiresAt,
+      expiryMinutes: upiSettings.expiryMinutes,
+      mode: 'upi-auto',
+    });
   });
 
-  // Local-only signature helper for the explicitly enabled development sandbox.
-  app.post('/api/payments/sandbox-sign', (req, res) => {
-    if (
-      !isLocalTestPaymentSandboxEnabled() ||
-      getRazorpayPublicConfig().isConfigured ||
-      !isLoopbackRequest(req)
-    ) {
-      res.status(403).json({ error: 'The test payment sandbox is only available locally.' });
-      return;
-    }
-
-    const razorpayOrderId = String(req.body?.razorpayOrderId || '');
+  // Record a customer-reported cancellation for support only; this never changes paid status.
+  app.post('/api/payments/fail', rateLimit('payment_fail_report', 10, 60_000), async (req, res) => {
+    const orderId = String(req.body?.orderId || '');
     const store = loadStore();
-    const order = store.orders.find((o) => o.razorpayOrderId === razorpayOrderId);
+    const order = store.orders.find((candidate) => candidate.id === orderId);
     if (!order) {
       res.status(404).json({ error: 'Order not found.' });
       return;
     }
-
-    const razorpayPaymentId = `pay_test_${crypto.randomBytes(6).toString('hex')}`;
-    const razorpaySignature = createSignatureForOrderPayment(
-      razorpayOrderId,
-      razorpayPaymentId,
-    );
-
-    res.json({ razorpayPaymentId, razorpaySignature });
-  });
-
-  // Record a browser-reported failure for support diagnostics only.
-  // Only a signed Razorpay webhook or server-side payment verification can set canonical order status.
-  app.post('/api/payments/fail', rateLimit('payment_fail_report', 10, 60_000), async (req, res) => {
-    const orderId = String(req.body?.orderId || '');
-    const store = loadStore();
-    const order = store.orders.find((o) => o.id === orderId);
-    if (!order) { res.status(404).json({ error: 'Order not found.' }); return; }
-    if (order.paymentStatus !== 'paid' && !store.payments.some((payment) => payment.orderId === order.id && payment.status === 'reported_failed')) {
-      const reportedPayment: PaymentRecord = {
-        id: generateId('pay'), razorpayPaymentId: `reported_failed_${order.id}`,
-        razorpayOrderId: order.razorpayOrderId, orderId: order.id,
-        amountPaise: order.amountPaise, currency: 'INR', method: 'unknown',
-        status: 'reported_failed', captured: false, signatureVerified: false,
+    if (
+      order.gateway === 'upi_auto' &&
+      order.paymentStatus !== 'paid' &&
+      !store.payments.some((payment) => payment.orderId === order.id && payment.status === 'reported_failed')
+    ) {
+      store.payments.unshift({
+        id: generateId('pay'),
+        gateway: 'upi_auto',
+        gatewayOrderId: order.gatewayOrderId,
+        orderId: order.id,
+        amountPaise: order.amountPaise,
+        currency: 'INR',
+        method: 'UPI',
+        status: 'reported_failed',
+        captured: false,
+        gatewayVerified: false,
         createdAt: new Date().toISOString(),
-      };
-      store.payments.unshift(reportedPayment);
+      });
       await saveStore(store);
       await syncPaymentSheetRow(order, store.payments, store.siteConfig);
     }
     res.json({ status: 'failure_report_recorded' });
   });
 
-  // Verify Payment Signature + Capture Status + Issue Protected Download Token
-  app.post('/api/payments/verify', rateLimit('verify', 20, 60_000), async (req, res) => {
-    const parsed = VerifyPaymentSchema.safeParse(req.body);
-    if (!parsed.success) {
-      res.status(400).json({ error: 'Payment verification parameters missing.' });
-      return;
-    }
-
-    const { orderId, razorpayOrderId, razorpayPaymentId, razorpaySignature } = parsed.data;
-
-    const store = loadStore();
-    const order = store.orders.find(
-      (o) => o.id === orderId && o.razorpayOrderId === razorpayOrderId,
-    );
-
-    if (!order) {
-      res.status(404).json({ error: 'Order record nahi mila.' });
-      return;
-    }
-
-    // Idempotent handling if already paid with same payment ID
-    const existingPayment = store.payments.find(
-      (p) => p.razorpayPaymentId === razorpayPaymentId,
-    );
-    if (existingPayment && existingPayment.orderId !== order.id) {
-      res.status(409).json({
+  // Server-to-server Paytm status verification. Browser events / screenshots are never accepted as proof.
+  app.post('/api/payments/verify', rateLimit('upi_status', 30, 60_000), async (req, res) => {
+    // The database record is the source of truth. Accept safe legacy IDs too;
+    // a strict SYF+24-hex regex can reject valid orders created by older builds.
+    const orderId = normalizeOrderId(req.body?.orderId ?? req.body?.gatewayOrderId);
+    if (!orderId) {
+      console.warn('Payment verification rejected a missing or malformed order ID', {
+        bodyType: typeof req.body,
+        bodyKeys: req.body && typeof req.body === 'object' ? Object.keys(req.body) : [],
+        receivedOrderIdType: typeof req.body?.orderId,
+        receivedOrderIdLength: typeof req.body?.orderId === 'string' ? req.body.orderId.length : undefined,
+      });
+      res.status(400).json({
         verified: false,
-        error: 'Payment is already associated with another order.',
+        status: 'review',
+        code: 'ORDER_ID_INVALID',
+        error: 'Checkout order ID is missing or malformed. Please contact support with the order shown on this screen.',
       });
       return;
     }
 
-    if (
-      existingPayment &&
-      isVerifiedCapturedPayment(order, existingPayment)
-    ) {
+    const store = loadStore();
+    const order = store.orders.find((candidate) => candidate.id === orderId)
+      || store.orders.find((candidate) => candidate.gatewayOrderId === orderId);
+    if (!order || order.gateway !== 'upi_auto' || !order.gatewayOrderId || !order.gatewayMerchantId) {
+      console.warn('Payment verification order lookup failed', {
+        orderIdPrefix: orderId.slice(0, 6),
+        orderIdLength: orderId.length,
+        orderFound: Boolean(order),
+        gateway: order?.gateway || null,
+        hasGatewayOrderId: Boolean(order?.gatewayOrderId),
+        hasMerchantId: Boolean(order?.gatewayMerchantId),
+      });
+      res.status(404).json({
+        verified: false,
+        status: 'review',
+        code: 'ORDER_NOT_FOUND',
+        error: 'This checkout order could not be found in the payment records. Do not pay again; contact support with the order ID.',
+      });
+      return;
+    }
+
+    const existingPayment = store.payments.find(
+      (payment) => payment.orderId === order.id && payment.gateway === 'upi_auto' && payment.captured,
+    );
+    if (order.paymentStatus === 'paid' && existingPayment && hasVerifiedCapturedPayment(order, [existingPayment])) {
       const downloadToken = await issueDownloadToken(order.id, order.productId);
       res.json({
         verified: true,
+        status: 'success',
         orderId: order.id,
-        paymentId: razorpayPaymentId,
+        paymentId: existingPayment.upiTransactionId,
         productId: order.productId,
         productName: order.productName,
         downloadToken,
@@ -764,81 +554,153 @@ export async function createApiApp() {
       return;
     }
 
-    const sigValid = verifyRazorpayPaymentSignature(
-      razorpayOrderId,
-      razorpayPaymentId,
-      razorpaySignature,
-    );
-
-    if (!sigValid) {
-      res.status(400).json({
-        verified: false,
-        error: 'Payment signature verify nahi ho paya. Kripya support se contact karein.',
-      });
+    if (order.paymentStatus === 'paid') {
+      res.status(409).json({ verified: false, status: 'review', error: 'Payment is marked paid but its verified transaction record is missing. Please contact support.' });
       return;
     }
 
-    const captureCheck = await verifyCapturedStatusWithRazorpay(
-      razorpayPaymentId,
-      order.amountPaise,
-      order.razorpayOrderId,
-    );
+    try {
+      const status = await getPaytmTransactionStatus(order.gatewayMerchantId, order.gatewayOrderId);
 
-    if (!captureCheck.captured) {
-      res.status(402).json({
+      if (status.status === 'success') {
+        if (!status.transactionId || status.amountPaise !== order.amountPaise) {
+          res.status(409).json({
+            verified: false,
+            status: 'review',
+            error: 'Paytm response amount/transaction ID did not match this order. Do not make another payment; contact support.',
+          });
+          return;
+        }
+
+        const duplicateTransaction = store.payments.find(
+          (payment) => payment.upiTransactionId === status.transactionId,
+        );
+        if (duplicateTransaction && duplicateTransaction.orderId !== order.id) {
+          res.status(409).json({
+            verified: false,
+            status: 'review',
+            error: 'This transaction ID is already linked to another order. Please contact support.',
+          });
+          return;
+        }
+
+        order.paymentStatus = 'paid';
+        order.orderStatus = 'completed';
+        order.paidAt = order.paidAt || new Date().toISOString();
+
+        if (existingPayment) {
+          existingPayment.gateway = 'upi_auto';
+          existingPayment.gatewayOrderId = order.gatewayOrderId;
+          existingPayment.upiTransactionId = status.transactionId;
+          existingPayment.amountPaise = order.amountPaise;
+          existingPayment.currency = 'INR';
+          existingPayment.method = status.paymentMode || 'UPI';
+          existingPayment.status = 'captured';
+          existingPayment.captured = true;
+          existingPayment.gatewayVerified = true;
+        } else {
+          store.payments.unshift({
+            id: generateId('pay'),
+            gateway: 'upi_auto',
+            gatewayOrderId: order.gatewayOrderId,
+            upiTransactionId: status.transactionId,
+            orderId: order.id,
+            amountPaise: order.amountPaise,
+            currency: 'INR',
+            method: status.paymentMode || 'UPI',
+            status: 'captured',
+            captured: true,
+            gatewayVerified: true,
+            createdAt: new Date().toISOString(),
+          });
+        }
+
+        const lead = store.leads.find((candidate) => candidate.phone === order.customerPhone && candidate.goal === order.productId);
+        if (lead) lead.purchased = true;
+
+        await saveStore(store);
+        await syncPaymentSheetRow(order, store.payments, store.siteConfig);
+        const downloadToken = await issueDownloadToken(order.id, order.productId);
+
+        res.json({
+          verified: true,
+          status: 'success',
+          orderId: order.id,
+          paymentId: status.transactionId,
+          productId: order.productId,
+          productName: order.productName,
+          downloadToken,
+        });
+        return;
+      }
+
+      if (status.status === 'failed') {
+        order.paymentStatus = 'failed';
+        order.orderStatus = 'failed';
+        const failedAlreadyRecorded = store.payments.some(
+          (payment) => payment.orderId === order.id && payment.status === 'failed',
+        );
+        if (!failedAlreadyRecorded) {
+          store.payments.unshift({
+            id: generateId('pay'),
+            gateway: 'upi_auto',
+            gatewayOrderId: order.gatewayOrderId,
+            upiTransactionId: status.transactionId,
+            orderId: order.id,
+            amountPaise: status.amountPaise ?? order.amountPaise,
+            currency: 'INR',
+            method: status.paymentMode || 'UPI',
+            status: 'failed',
+            captured: false,
+            gatewayVerified: true,
+            createdAt: new Date().toISOString(),
+          });
+        }
+        await saveStore(store);
+        await syncPaymentSheetRow(order, store.payments, store.siteConfig);
+        res.json({
+          verified: false,
+          status: 'failed',
+          error: status.responseMessage || 'Paytm has confirmed that this payment failed.',
+        });
+        return;
+      }
+
+      const qrExpiredAt = order.expiresAt ? Date.parse(order.expiresAt) : Number.NaN;
+      const qrExpired = Number.isFinite(qrExpiredAt) && qrExpiredAt <= Date.now();
+      // UPI/issuer confirmation can arrive after the QR countdown. Do not stop
+      // reconciliation at the QR expiry itself; keep checking for late success.
+      // Only close the order after a further 30-minute reconciliation window.
+      const reconciliationEnded = qrExpired && Date.now() > qrExpiredAt + 30 * 60_000;
+      if (reconciliationEnded) {
+        order.paymentStatus = 'expired';
+        order.orderStatus = 'expired';
+        await saveStore(store);
+        await syncPaymentSheetRow(order, store.payments, store.siteConfig);
+        res.json({
+          verified: false,
+          status: 'expired',
+          error: 'No matching successful transaction was found. The QR has expired. Contact support before paying again.',
+        });
+        return;
+      }
+
+      res.json({
         verified: false,
-        error: 'Payment abhi capture nahi hua hai. Thodi der mein check karein.',
+        status: 'pending',
+        qrExpired,
+        message: qrExpired
+          ? 'QR timer ended. We are still checking for a delayed UPI confirmation. Do not pay again yet.'
+          : status.responseMessage || 'Payment abhi confirm nahi hua. Status automatically check hota rahega.',
       });
-      return;
-    }
-
-    order.paymentStatus = 'paid';
-    order.orderStatus = 'completed';
-    order.paidAt = order.paidAt || new Date().toISOString();
-
-    if (existingPayment) {
-      existingPayment.razorpayOrderId = razorpayOrderId;
-      existingPayment.orderId = order.id;
-      existingPayment.amountPaise = order.amountPaise;
-      existingPayment.currency = 'INR';
-      existingPayment.method = captureCheck.method;
-      existingPayment.status = 'captured';
-      existingPayment.captured = true;
-      existingPayment.signatureVerified = true;
-    } else {
-      store.payments.unshift({
-        id: generateId('pay'),
-        razorpayPaymentId,
-        razorpayOrderId,
-        orderId: order.id,
-        amountPaise: order.amountPaise,
-        currency: 'INR',
-        method: captureCheck.method,
-        status: 'captured',
-        captured: true,
-        signatureVerified: true,
-        createdAt: new Date().toISOString(),
+    } catch (error) {
+      console.error('UPI Auto payment status check failed:', error instanceof Error ? error.message : 'Unknown Paytm status error');
+      res.status(503).json({
+        verified: false,
+        status: 'pending',
+        error: 'Payment status service temporarily unavailable. Please keep this window open; it will retry automatically.',
       });
     }
-
-    const lead = store.leads.find((l) => l.phone === order.customerPhone);
-    if (lead) {
-      lead.purchased = true;
-    }
-
-    await saveStore(store);
-    await syncPaymentSheetRow(order, store.payments, store.siteConfig);
-
-    const downloadToken = await issueDownloadToken(order.id, order.productId);
-
-    res.json({
-      verified: true,
-      orderId: order.id,
-      paymentId: razorpayPaymentId,
-      productId: order.productId,
-      productName: order.productName,
-      downloadToken,
-    });
   });
 
   // Recover Download Link for Paid Orders
@@ -853,7 +715,9 @@ export async function createApiApp() {
     const store = loadStore();
 
     const matchedPayment = store.payments.find(
-      (p) => p.razorpayPaymentId === orderOrPaymentId,
+      (payment) =>
+        payment.upiTransactionId === orderOrPaymentId ||
+        payment.razorpayPaymentId === orderOrPaymentId,
     );
 
     const order = store.orders.find(
@@ -929,14 +793,14 @@ export async function createApiApp() {
       return;
     }
 
+    // Render the order-specific PDF before consuming a download attempt.
+    const pdfBuffer = await getOrCreatePrivatePdf(product.id, order);
     tokenRecord.downloadCount += 1;
     await saveStore(store);
-
-    const pdfBuffer = await getOrCreatePrivatePdf(product.id, product.pdfFilename);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="Santosh_Yadav_${product.slug}.pdf"`,
+      `attachment; filename="Santosh_Yadav_${product.slug}_${order.id}.pdf"`,
     );
     res.setHeader('Cache-Control', 'private, no-store');
     res.setHeader('X-Robots-Tag', 'noindex, nofollow');
@@ -983,7 +847,8 @@ export async function createApiApp() {
       paidOrders.reduce((acc, o) => acc + o.amountPaise, 0) / 100,
     );
 
-    const { googleSheets: storedSheets, ...publicSiteConfig } = store.siteConfig;
+    const { googleSheets: storedSheets, upiAuto: storedUpiAuto, ...publicSiteConfig } = store.siteConfig;
+    const upiSettings = getUpiAutoSettings({ ...store.siteConfig, upiAuto: storedUpiAuto });
     const resolvedSheets = resolveGoogleSheetsConfig(store.siteConfig);
 
     res.json({
@@ -1001,6 +866,13 @@ export async function createApiApp() {
       leads: store.leads.slice(0, 200),
       downloadTokens: store.downloadTokens.slice(0, 100),
       siteConfig: publicSiteConfig,
+      upiAutoConfig: {
+        enabled: Boolean(upiSettings.enabled),
+        configured: isUpiAutoConfigured(upiSettings),
+        merchantId: upiSettings.merchantId,
+        upiId: upiSettings.upiId,
+        expiryMinutes: upiSettings.expiryMinutes,
+      },
       googleSheetsConfig: {
         sheetId: storedSheets?.sheetId || '',
         sheetTab: storedSheets?.sheetTab || process.env.GOOGLE_SHEET_TAB || 'Leads',
@@ -1053,41 +925,6 @@ export async function createApiApp() {
     res.json({ product });
   });
 
-  app.post('/api/admin/products/:id/pdf', requireAdmin, async (req, res) => {
-    const id = req.params.id as GoalSlug;
-    const store = loadStore();
-    const product = store.products[id];
-    if (!product) {
-      res.status(404).json({ error: 'Product not found' });
-      return;
-    }
-
-    const base64 = String(req.body?.base64Pdf || '');
-    if (!base64) {
-      res.status(400).json({ error: 'Missing PDF file payload' });
-      return;
-    }
-
-    const cleanB64 = base64.replace(/^data:application\/pdf;base64,/, '');
-    const buffer = Buffer.from(cleanB64, 'base64');
-    if (buffer.subarray(0, 4).toString('utf8') !== '%PDF') {
-      res.status(400).json({ error: 'Uploaded file valid PDF nahi hai.' });
-      return;
-    }
-
-    if (buffer.length > 3 * 1024 * 1024) {
-      res.status(413).json({ error: 'PDF must be 3 MB or smaller for Vercel upload limits.' });
-      return;
-    }
-    await saveUploadedPrivatePdf(product.pdfFilename, buffer);
-    product.updatedAt = new Date().toISOString();
-
-    const actor = (req as Request & { adminEmail?: string }).adminEmail || 'admin';
-    appendAuditLog(store, actor, `Replaced private PDF for ${product.id} (${buffer.length} bytes)`);
-    await saveStore(store);
-
-    res.json({ status: 'uploaded', bytes: buffer.length });
-  });
 
   app.patch('/api/admin/content', requireAdmin, async (req, res) => {
     const store = loadStore();
@@ -1129,8 +966,50 @@ export async function createApiApp() {
     appendAuditLog(store, actor, 'Updated site content & settings');
     await saveStore(store);
 
-    const { googleSheets: _hiddenSheets, ...publicSiteConfig } = store.siteConfig;
+    const { googleSheets: _hiddenSheets, upiAuto: _hiddenUpiAuto, ...publicSiteConfig } = store.siteConfig;
     res.json({ siteConfig: publicSiteConfig });
+  });
+
+  app.patch('/api/admin/upi-auto', requireAdmin, async (req, res) => {
+    const store = loadStore();
+    const body = req.body || {};
+    const enabled = typeof body.enabled === 'boolean' ? body.enabled : false;
+    const merchantId = String(body.merchantId || '').trim();
+    const upiId = String(body.upiId || '').trim();
+    const expiryMinutes = Number(body.expiryMinutes);
+
+    if (merchantId.length > 64) {
+      res.status(400).json({ error: 'Paytm Merchant ID must be 64 characters or fewer.' });
+      return;
+    }
+    if (upiId && !/^[^\s@]+@[^\s@]+$/.test(upiId)) {
+      res.status(400).json({ error: 'Enter a valid UPI ID / VPA (example: name@bank).' });
+      return;
+    }
+    if (!Number.isInteger(expiryMinutes) || expiryMinutes < 5 || expiryMinutes > 60) {
+      res.status(400).json({ error: 'Payment expiry must be between 5 and 60 minutes.' });
+      return;
+    }
+    if (enabled && (!merchantId || !upiId)) {
+      res.status(400).json({ error: 'Merchant ID and UPI ID are required before enabling UPI Auto.' });
+      return;
+    }
+
+    store.siteConfig.upiAuto = { enabled, merchantId, upiId, expiryMinutes };
+    store.siteConfig.updatedAt = new Date().toISOString();
+    const actor = (req as Request & { adminEmail?: string }).adminEmail || 'admin';
+    appendAuditLog(store, actor, `Updated UPI Auto settings (enabled=${enabled}, VPA=${upiId || 'unset'})`);
+    await saveStore(store);
+
+    res.json({
+      upiAutoConfig: {
+        enabled,
+        configured: isUpiAutoConfigured(getUpiAutoSettings(store.siteConfig)),
+        merchantId,
+        upiId,
+        expiryMinutes,
+      },
+    });
   });
 
   app.patch('/api/admin/google-sheets', requireAdmin, async (req, res) => {

@@ -48,26 +48,36 @@ export interface OrderRecord {
   dietPreference?: string;
   productId: GoalSlug;
   productName: string;
-  razorpayOrderId: string;
+  gateway?: 'upi_auto' | 'razorpay_legacy';
+  gatewayOrderId?: string;
+  gatewayMerchantId?: string;
+  // Retained only to preserve verification/download access for historical Razorpay orders.
+  razorpayOrderId?: string;
   amountPaise: number;
   currency: 'INR';
-  paymentStatus: 'pending' | 'paid' | 'failed';
-  orderStatus: 'created' | 'completed' | 'failed';
+  paymentStatus: 'pending' | 'paid' | 'failed' | 'expired';
+  orderStatus: 'created' | 'completed' | 'failed' | 'expired';
+  expiresAt?: string;
   createdAt: string;
   paidAt?: string;
 }
 
 export interface PaymentRecord {
   id: string;
-  razorpayPaymentId: string;
-  razorpayOrderId: string;
   orderId: string;
   amountPaise: number;
   currency: 'INR';
   method: string;
+  gateway?: 'upi_auto' | 'razorpay_legacy';
+  gatewayOrderId?: string;
+  upiTransactionId?: string;
+  // Retained only for historical Razorpay transactions already in MongoDB.
+  razorpayPaymentId?: string;
+  razorpayOrderId?: string;
   status?: 'captured' | 'failed' | 'reported_failed';
   captured: boolean;
-  signatureVerified: boolean;
+  gatewayVerified?: boolean;
+  signatureVerified?: boolean;
   webhookEventId?: string;
   createdAt: string;
 }
@@ -96,6 +106,12 @@ export interface SiteConfigRecord {
   heroHeadline: string;
   heroDescription: string;
   maintenanceMode: boolean;
+  upiAuto?: {
+    enabled: boolean;
+    merchantId: string;
+    upiId: string;
+    expiryMinutes: number;
+  };
   googleSheets?: {
     sheetId: string;
     sheetTab: string;
@@ -170,6 +186,12 @@ function createDefaultStore(): StoreDatabase {
       heroHeadline: process.env.HERO_HEADLINE || '',
       heroDescription: process.env.HERO_DESCRIPTION || '',
       maintenanceMode: false,
+      upiAuto: {
+        enabled: false,
+        merchantId: '',
+        upiId: '',
+        expiryMinutes: 10,
+      },
       updatedAt: now,
     },
     auditLogs: [],

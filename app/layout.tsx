@@ -1,6 +1,5 @@
 import type { Metadata, Viewport } from 'next';
 import type { ReactNode } from 'react';
-import Script from 'next/script';
 import '../src/index.css';
 
 export const metadata: Metadata = {
@@ -32,7 +31,6 @@ export default function RootLayout({ children }: Readonly<{ children: ReactNode 
       </head>
       <body className="bg-[#0B0D0E] text-[#211A15] antialiased selection:bg-[#F47716]/25 selection:text-[#F47716]">
         {children}
-        <Script src="https://checkout.razorpay.com/v1/checkout.js" strategy="afterInteractive" />
       </body>
     </html>
   );

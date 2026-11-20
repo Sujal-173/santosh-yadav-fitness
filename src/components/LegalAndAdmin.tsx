@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import {
   ArrowLeft,
+  QrCode,
   CheckCircle2,
   Copy,
   Download,
@@ -49,19 +50,20 @@ export function LegalPageView({ type, siteConfig, onBackHome }: LegalPageProps) 
           <div className="space-y-4 text-sm sm:text-base text-[#3E3732] leading-relaxed">
             <p>
               <strong>{siteConfig.brandName}</strong> aapki privacy ko respect karta hai. Jab aap
-              diet plan kharidte hain ya enquiry submit karte hain, hum sirf zaroori contact details
-              (Naam, WhatsApp/Mobile number aur optional Email) collect karte hain.
+              diet plan kharidte hain, hum contact details ke saath age, gender, height, current
+              weight aur food preference collect karte hain taaki aapke profile ke hisaab se PDF
+              meal portions personalize kiye ja sakein. Email optional hai.
             </p>
             <h2 className="text-lg font-bold text-[#211A15] pt-2">Data Ka Use</h2>
             <ul className="list-disc pl-5 space-y-1.5">
-              <li>Order verification, Razorpay payment tracking aur PDF download link delivery ke liye.</li>
-              <li>Customer support requests (WhatsApp par meal-related help) solve karne ke liye.</li>
+              <li>Order verification, UPI payment tracking aur secure PDF download delivery ke liye.</li>
+              <li>Aapke diye gaye measurements aur food preference ke basis par personalized meal portions aur nutrition estimates generate karne ke liye.</li>
+              <li>Customer support requests aur order-related communication ke liye.</li>
               <li>Hum aapka phone number ya personal details kisi third-party advertising agency ko sell ya share nahi karte.</li>
             </ul>
             <h2 className="text-lg font-bold text-[#211A15] pt-2">Payment Security</h2>
             <p>
-              Sabhi payments Razorpay ke encrypted gateway par process hote hain. Hum kabhi bhi aapka
-              card number, CVV ya UPI PIN store nahi karte.
+              UPI payments aapke UPI app ya bank ke through process hote hain. Hum kabhi bhi aapka UPI PIN, banking password ya OTP store nahi karte.
             </p>
             <h2 className="text-lg font-bold text-[#211A15] pt-2">Data Deletion Request</h2>
             <p>
@@ -146,12 +148,30 @@ interface AdminOverviewData {
     dietPreference?: string;
     productId: GoalSlug;
     productName: string;
-    razorpayOrderId: string;
+    gateway?: string;
+    gatewayOrderId?: string;
+    razorpayOrderId?: string;
     amountPaise: number;
     paymentStatus: string;
     createdAt: string;
   }>;
-  payments: Array<{ id: string; razorpayPaymentId: string; razorpayOrderId: string; orderId: string; amountPaise: number; currency: string; method: string; status?: 'captured' | 'failed' | 'reported_failed'; captured: boolean; signatureVerified: boolean; createdAt: string }>;
+  payments: Array<{
+    id: string;
+    gateway?: string;
+    gatewayOrderId?: string;
+    upiTransactionId?: string;
+    razorpayPaymentId?: string;
+    razorpayOrderId?: string;
+    orderId: string;
+    amountPaise: number;
+    currency: string;
+    method: string;
+    status?: 'captured' | 'failed' | 'reported_failed';
+    captured: boolean;
+    gatewayVerified?: boolean;
+    signatureVerified?: boolean;
+    createdAt: string;
+  }>;
   leads: Array<{
     id: string;
     name: string;
@@ -171,6 +191,13 @@ interface AdminOverviewData {
     createdAt: string;
   }>;
   siteConfig: SiteConfigDto;
+  upiAutoConfig?: {
+    enabled: boolean;
+    configured: boolean;
+    merchantId: string;
+    upiId: string;
+    expiryMinutes: number;
+  };
   googleSheetsConfig?: {
     sheetId: string;
     sheetTab: string;
@@ -194,7 +221,7 @@ export function AdminDashboardView({ onBackHome, onConfigUpdated }: AdminDashboa
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState('');
-  const [tab, setTab] = useState<'overview' | 'orders' | 'payments' | 'leads' | 'products' | 'sheets' | 'settings'>(
+  const [tab, setTab] = useState<'overview' | 'orders' | 'payments' | 'leads' | 'products' | 'upi-auto' | 'sheets' | 'settings'>(
     'overview',
   );
   const [overview, setOverview] = useState<AdminOverviewData | null>(null);
@@ -211,6 +238,15 @@ export function AdminDashboardView({ onBackHome, onConfigUpdated }: AdminDashboa
   });
   const [sheetsBusy, setSheetsBusy] = useState(false);
 
+  // Paytm Business UPI Auto settings (MID + UPI VPA + QR expiry).
+  const [upiAutoForm, setUpiAutoForm] = useState({
+    enabled: false,
+    merchantId: '',
+    upiId: '',
+    expiryMinutes: 10,
+  });
+  const [upiAutoBusy, setUpiAutoBusy] = useState(false);
+
   const loadOverview = async () => {
     const res = await fetch('/api/admin/overview');
     if (res.status === 401) {
@@ -221,6 +257,14 @@ export function AdminDashboardView({ onBackHome, onConfigUpdated }: AdminDashboa
       const data = (await res.json()) as AdminOverviewData;
       setOverview(data);
       setSettingsForm(data.siteConfig);
+      if (data.upiAutoConfig) {
+        setUpiAutoForm({
+          enabled: data.upiAutoConfig.enabled,
+          merchantId: data.upiAutoConfig.merchantId || '',
+          upiId: data.upiAutoConfig.upiId || '',
+          expiryMinutes: data.upiAutoConfig.expiryMinutes || 10,
+        });
+      }
       if (data.googleSheetsConfig) {
         setSheetsForm({
           sheetId: data.googleSheetsConfig.sheetId || '',
@@ -268,63 +312,69 @@ export function AdminDashboardView({ onBackHome, onConfigUpdated }: AdminDashboa
   };
 
   const handleUpdateProduct = async (product: ProductDto, newPriceInr: number, active: boolean) => {
-    const res = await fetch(`/api/admin/products/${product.id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ priceInr: newPriceInr, active }),
-    });
-    if (res.ok) {
+    try {
+      if (!Number.isFinite(newPriceInr) || newPriceInr <= 0) {
+        setStatusNotice('Enter a valid product price greater than zero.');
+        return;
+      }
+      const res = await fetch(`/api/admin/products/${product.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ priceInr: newPriceInr, active }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Product update failed.');
       setStatusNotice(`${product.name} updated.`);
       await loadOverview();
       onConfigUpdated();
+    } catch (error) {
+      setStatusNotice(error instanceof Error ? error.message : 'Product update request failed.');
     }
   };
 
-  const handleUploadPdf = async (productId: GoalSlug, file: File) => {
-    if (file.type !== 'application/pdf') {
-      setStatusNotice('Please select a valid PDF file.');
-      return;
-    }
-    if (file.size > 3 * 1024 * 1024) {
-      setStatusNotice('PDF must be 3 MB or smaller for secure Vercel upload.');
-      return;
-    }
-    const reader = new FileReader();
-    reader.onerror = () => setStatusNotice('PDF could not be read. Please try again.');
-    reader.onload = async () => {
-      const base64Pdf = String(reader.result || '');
-      try {
-        const res = await fetch(`/api/admin/products/${productId}/pdf`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ base64Pdf }),
-        });
-        if (res.ok) {
-          setStatusNotice(`New PDF uploaded securely for ${productId}.`);
-          await loadOverview();
-        } else {
-          const data = await res.json();
-          setStatusNotice(data.error || 'PDF upload failed.');
-        }
-      } catch {
-        setStatusNotice('PDF upload request failed. Check your connection and try again.');
-      }
-    };
-    reader.readAsDataURL(file);
-  };
 
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!settingsForm) return;
-    const res = await fetch('/api/admin/content', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(settingsForm),
-    });
-    if (res.ok) {
+    try {
+      const res = await fetch('/api/admin/content', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(settingsForm),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Website settings could not be saved.');
       setStatusNotice('Website settings & content saved.');
       await loadOverview();
       onConfigUpdated();
+    } catch (error) {
+      setStatusNotice(error instanceof Error ? error.message : 'Website settings request failed.');
+    }
+  };
+
+  const handleSaveUpiAuto = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setUpiAutoBusy(true);
+    try {
+      const res = await fetch('/api/admin/upi-auto', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(upiAutoForm),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setStatusNotice(data.upiAutoConfig?.configured
+          ? 'UPI Auto settings saved. New checkout orders will use this UPI account.'
+          : 'UPI Auto settings saved, but the gateway remains unavailable until MID and UPI ID are completed and enabled.');
+        await loadOverview();
+        onConfigUpdated();
+      } else {
+        setStatusNotice(data.error || 'Could not save UPI Auto settings.');
+      }
+    } catch {
+      setStatusNotice('UPI Auto settings request failed. Check your connection.');
+    } finally {
+      setUpiAutoBusy(false);
     }
   };
 
@@ -472,7 +522,7 @@ export function AdminDashboardView({ onBackHome, onConfigUpdated }: AdminDashboa
               Admin Dashboard
             </h1>
             <p className="text-xs text-[#A6A09A]">
-              Manage orders, Razorpay payments, leads, private PDFs, and storefront copy.
+              Manage orders, UPI transactions, customer profiles, personalized PDFs, and storefront copy.
             </p>
           </div>
           <div className="flex items-center gap-3">
@@ -516,7 +566,8 @@ export function AdminDashboardView({ onBackHome, onConfigUpdated }: AdminDashboa
               { id: 'orders', label: 'Orders', icon: FileText },
               { id: 'payments', label: 'Transactions', icon: CheckCircle2 },
               { id: 'leads', label: 'Leads', icon: Users },
-              { id: 'products', label: 'Products & PDFs', icon: Download },
+              { id: 'products', label: 'Products & Diet PDFs', icon: Download },
+              { id: 'upi-auto', label: 'UPI Auto Gateway', icon: QrCode },
               { id: 'sheets', label: 'Google Sheets', icon: FileSpreadsheet },
               { id: 'settings', label: 'Content & Settings', icon: Settings },
             ] as const
@@ -663,17 +714,17 @@ export function AdminDashboardView({ onBackHome, onConfigUpdated }: AdminDashboa
           <div className="bg-[#141719] border border-white/10 rounded-xl overflow-x-auto">
             <table className="w-full text-left text-xs sm:text-sm">
               <thead className="bg-[#0B0D0E] text-[#A6A09A] border-b border-white/10">
-                <tr><th className="px-4 py-3">Payment ID</th><th className="px-4 py-3">Order ID</th><th className="px-4 py-3">Amount</th><th className="px-4 py-3">Method</th><th className="px-4 py-3">Status</th><th className="px-4 py-3">Signature</th><th className="px-4 py-3">Date</th></tr>
+                <tr><th className="px-4 py-3">Transaction ID</th><th className="px-4 py-3">UPI Order ID</th><th className="px-4 py-3">Amount</th><th className="px-4 py-3">Method</th><th className="px-4 py-3">Status</th><th className="px-4 py-3">Verification</th><th className="px-4 py-3">Date</th></tr>
               </thead>
               <tbody className="divide-y divide-white/8">
                 {overview.payments.length === 0 ? <tr><td colSpan={7} className="px-4 py-8 text-center text-[#A6A09A]">No payment transactions recorded yet.</td></tr> : overview.payments.map((payment) => (
                   <tr key={payment.id}>
-                    <td className="px-4 py-3 font-semibold tabular-nums">{payment.razorpayPaymentId}</td>
-                    <td className="px-4 py-3 tabular-nums">{payment.razorpayOrderId}</td>
+                    <td className="px-4 py-3 font-semibold tabular-nums">{payment.upiTransactionId || payment.razorpayPaymentId || '—'}</td>
+                    <td className="px-4 py-3 tabular-nums">{payment.gatewayOrderId || payment.razorpayOrderId || '—'}</td>
                     <td className="px-4 py-3 tabular-nums">₹{(payment.amountPaise / 100).toFixed(2)}</td>
                     <td className="px-4 py-3 uppercase">{payment.method}</td>
                     <td className={`px-4 py-3 font-semibold ${payment.captured ? 'text-emerald-400' : 'text-red-400'}`}>{payment.status === 'reported_failed' ? 'Customer reported failure' : payment.captured ? 'Completed' : 'Failed'}</td>
-                    <td className="px-4 py-3">{payment.signatureVerified ? 'Verified' : 'Not verified'}</td>
+                    <td className="px-4 py-3">{payment.gatewayVerified ? 'Paytm confirmed' : payment.signatureVerified ? 'Legacy verified' : 'Unverified'}</td>
                     <td className="px-4 py-3 text-xs text-[#A6A09A]">{new Date(payment.createdAt).toLocaleString()}</td>
                   </tr>
                 ))}
@@ -806,10 +857,94 @@ export function AdminDashboardView({ onBackHome, onConfigUpdated }: AdminDashboa
                 key={prod.id}
                 product={prod}
                 onSave={handleUpdateProduct}
-                onUploadPdf={handleUploadPdf}
               />
             ))}
           </div>
+        )}
+
+        {tab === 'upi-auto' && overview && (
+          <form
+            onSubmit={handleSaveUpiAuto}
+            className="bg-[#141719] border border-white/10 rounded-xl p-5 sm:p-6 space-y-5 max-w-3xl"
+          >
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#F47716]">Paytm Business · UPI Intent QR</p>
+                <h2 className="text-xl font-bold text-white mt-1">UPI Auto Gateway</h2>
+                <p className="text-xs text-[#A6A09A] mt-1 max-w-xl">
+                  Checkout will create a unique UPI QR for each order and verify payment status on the server using the Merchant ID and UPI order ID.
+                </p>
+              </div>
+              <span className={`px-3 py-1.5 rounded-full text-[11px] font-bold uppercase tracking-wide ${overview.upiAutoConfig?.configured ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/25' : 'bg-amber-500/10 text-amber-300 border border-amber-500/25'}`}>
+                {overview.upiAutoConfig?.configured ? 'Configured' : 'Not configured'}
+              </span>
+            </div>
+
+            <label className="flex items-center gap-3 rounded-lg border border-white/10 bg-[#0B0D0E] px-4 py-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={upiAutoForm.enabled}
+                onChange={(e) => setUpiAutoForm({ ...upiAutoForm, enabled: e.target.checked })}
+                className="h-4 w-4 accent-[#F47716]"
+              />
+              <span>
+                <span className="block text-sm font-semibold text-white">Enable UPI Auto payments</span>
+                <span className="block text-[11px] text-[#A6A09A]">When disabled, new checkout attempts are blocked. Existing pending orders can still be checked.</span>
+              </span>
+            </label>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-semibold text-[#C9C1B9] mb-1.5">Paytm Business Merchant ID (MID)</label>
+                <input
+                  type="text"
+                  autoComplete="off"
+                  value={upiAutoForm.merchantId}
+                  onChange={(e) => setUpiAutoForm({ ...upiAutoForm, merchantId: e.target.value.trim() })}
+                  placeholder="Enter your Paytm MID"
+                  className="w-full rounded-lg bg-[#0B0D0E] border border-white/15 px-3 py-2.5 text-sm text-white"
+                />
+                <p className="text-[11px] text-[#847D76] mt-1">Used only by the backend to query Paytm transaction status.</p>
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-[#C9C1B9] mb-1.5">UPI ID / VPA</label>
+                <input
+                  type="text"
+                  autoComplete="off"
+                  value={upiAutoForm.upiId}
+                  onChange={(e) => setUpiAutoForm({ ...upiAutoForm, upiId: e.target.value.trim() })}
+                  placeholder="yourname@bank"
+                  className="w-full rounded-lg bg-[#0B0D0E] border border-white/15 px-3 py-2.5 text-sm text-white"
+                />
+                <p className="text-[11px] text-[#847D76] mt-1">This VPA is embedded into the customer’s QR and UPI payment link.</p>
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-[#C9C1B9] mb-1.5">QR Expiry (minutes)</label>
+                <input
+                  type="number"
+                  min={5}
+                  max={60}
+                  step={1}
+                  value={upiAutoForm.expiryMinutes}
+                  onChange={(e) => setUpiAutoForm({ ...upiAutoForm, expiryMinutes: Number(e.target.value) })}
+                  className="w-full rounded-lg bg-[#0B0D0E] border border-white/15 px-3 py-2.5 text-sm text-white"
+                />
+                <p className="text-[11px] text-[#847D76] mt-1">Allowed range: 5–60 minutes. Default: 10 minutes.</p>
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-amber-400/20 bg-amber-400/5 p-4 text-xs text-amber-100/90 leading-relaxed">
+              <strong className="text-amber-200">Important compatibility check:</strong> this follows the uploaded SMMHUT Paytm Business flow (UPI intent QR + Paytm order-status lookup). It is not a universal UPI acquiring API. Before going live, confirm that your Paytm merchant MID can return status for these QR-originated order IDs. Keep the gateway disabled until Paytm confirms this flow for your account.
+            </div>
+
+            <button
+              type="submit"
+              disabled={upiAutoBusy}
+              className="inline-flex items-center justify-center gap-2 rounded-lg bg-[#F47716] hover:bg-[#FF9A32] disabled:opacity-60 text-white font-semibold text-sm px-5 py-3"
+            >
+              {upiAutoBusy ? 'Saving settings…' : 'Save UPI Auto Settings'}
+            </button>
+          </form>
         )}
 
         {tab === 'sheets' && overview && (
@@ -928,11 +1063,9 @@ export function AdminDashboardView({ onBackHome, onConfigUpdated }: AdminDashboa
 function ProductAdminCard({
   product,
   onSave,
-  onUploadPdf,
 }: {
   product: ProductDto;
   onSave: (product: ProductDto, priceInr: number, active: boolean) => Promise<void>;
-  onUploadPdf: (productId: GoalSlug, file: File) => Promise<void>;
 }) {
   const [priceInr, setPriceInr] = useState(Math.round(product.pricePaise / 100));
   const [active, setActive] = useState(product.active);
@@ -941,7 +1074,7 @@ function ProductAdminCard({
     <div className="bg-[#141719] border border-white/10 rounded-xl p-5 space-y-4">
       <div className="flex items-center justify-between">
         <h3 className="text-base font-bold">{product.name}</h3>
-        <span className="text-xs text-[#A6A09A]">{product.pdfFilename}</span>
+        <span className="text-xs text-[#A6A09A]">Personalized PDF</span>
       </div>
 
       <div className="grid grid-cols-2 gap-3">
@@ -976,19 +1109,10 @@ function ProductAdminCard({
         Save Price &amp; Status
       </button>
 
-      <div className="pt-3 border-t border-white/10">
-        <label className="block text-xs text-[#A6A09A] mb-1.5">
-          Replace Private PDF File
-        </label>
-        <input
-          type="file"
-          accept="application/pdf"
-          onChange={(e) => {
-            const file = e.target.files?.[0];
-            if (file) onUploadPdf(product.id, file);
-          }}
-          className="text-xs text-[#D6CFC7] file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:bg-white/10 file:text-white hover:file:bg-white/20 cursor-pointer"
-        />
+      <div className="pt-3 border-t border-white/10 text-xs leading-relaxed text-[#A6A09A]">
+        Personalized PDF template: generated separately for every verified order using the
+        customer profile (age, gender, height, weight and diet preference). A shared static
+        PDF is never delivered.
       </div>
     </div>
   );
@@ -1015,7 +1139,7 @@ const APPS_SCRIPT_SNIPPET = `function doPost(e) {
     'Height (cm)','Weight (kg)','Diet Type','Status','Source'
   ];
   var paymentHeaders = [
-    'Order ID','Razorpay Order ID','Payment ID','Buyer Name','Mobile Number',
+    'Order ID','Gateway Order ID','Transaction ID','Buyer Name','Mobile Number',
     'Email','Plan Purchased','Amount (INR)','Payment Status','Order Status',
     'Latest Attempt','Payment Method','Order Time (IST)','Payment Time (IST)',
     'Attempt Time (IST)'

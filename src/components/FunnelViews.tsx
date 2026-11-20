@@ -21,18 +21,9 @@ import type {
   ProductDto,
   SiteConfigDto,
 } from '../types';
-import { SandboxRazorpayModal } from './Modals';
+import { UpiAutoPaymentModal } from './Modals';
 import { EASE_OUT_EXPO } from './MotionPrimitives';
 import { ResilientImage } from './ResilientImage';
-
-declare global {
-  interface Window {
-    Razorpay?: new (options: Record<string, unknown>) => {
-      open: () => void;
-      on: (event: string, cb: (res: { error?: { description?: string } }) => void) => void;
-    };
-  }
-}
 
 interface CheckoutViewProps {
   siteConfig: SiteConfigDto;
@@ -65,45 +56,26 @@ export function CheckoutView({
   const [dietPreference, setDietPreference] = useState<'Vegetarian' | 'Non-Vegetarian' | 'Eggetarian'>(
     initialProfile?.dietPreference || 'Vegetarian',
   );
-  const [consentAccepted, setConsentAccepted] = useState(true);
+  const [consentAccepted, setConsentAccepted] = useState(false);
   const [formError, setFormError] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
-  // Active server-created Razorpay order for sandbox modal when live keys aren't set
-  const [sandboxOrder, setSandboxOrder] = useState<OrderCreateResponse | null>(null);
+  // Active UPI Auto QR order. Payment is confirmed only by the backend Paytm status query.
+  const [upiOrder, setUpiOrder] = useState<OrderCreateResponse | null>(null);
 
   const selectedProduct = products.find((p) => p.id === selectedGoal) || products[0];
   const priceInr = Math.round((selectedProduct?.pricePaise || 0) / 100);
 
-  const verifyWithBackend = async (params: {
+  const handleUpiVerified = (data: {
     orderId: string;
-    razorpayOrderId: string;
-    razorpayPaymentId: string;
-    razorpaySignature: string;
-    method: string;
+    paymentId: string;
+    productId: GoalSlug;
+    productName: string;
+    downloadToken: string;
   }) => {
-    const res = await fetch('/api/payments/verify', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params),
-    });
-    const data = await res.json();
-    if (!res.ok || !data.verified) {
-      setSandboxOrder(null);
-      onPaymentFailed(
-        data.error || 'Payment verify nahi ho paya. Kripya support se contact karein.',
-        params.orderId,
-      );
-      return;
-    }
-
-    setSandboxOrder(null);
+    setUpiOrder(null);
     onPaymentSuccess({
-      orderId: data.orderId,
-      paymentId: data.paymentId,
-      productId: data.productId,
-      productName: data.productName,
-      downloadToken: data.downloadToken,
+      ...data,
       customerName: name.trim(),
       customerPhone: phone.trim(),
     });
@@ -176,64 +148,7 @@ export function CheckoutView({
         return;
       }
 
-      if (orderData.mode === 'razorpay' && orderData.keyId && window.Razorpay) {
-        const rzp = new window.Razorpay({
-          key: orderData.keyId,
-          amount: orderData.amountPaise,
-          currency: orderData.currency,
-          name: siteConfig.brandName,
-          description: orderData.productName,
-          order_id: orderData.razorpayOrderId,
-          prefill: {
-            name: cleanName,
-            contact: cleanPhone,
-            email: cleanEmail || undefined,
-          },
-          theme: { color: '#F47716' },
-          handler: async (response: {
-            razorpay_payment_id: string;
-            razorpay_order_id: string;
-            razorpay_signature: string;
-          }) => {
-            await verifyWithBackend({
-              orderId: orderData.orderId,
-              razorpayOrderId: response.razorpay_order_id,
-              razorpayPaymentId: response.razorpay_payment_id,
-              razorpaySignature: response.razorpay_signature,
-              method: 'razorpay',
-            });
-          },
-          modal: {
-            ondismiss: async () => {
-              await fetch('/api/payments/fail', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ orderId: orderData.orderId }),
-              });
-              onPaymentFailed('Aapne checkout band kar diya.', orderData.orderId);
-            },
-          },
-        });
-
-        rzp.on('payment.failed', async (failRes) => {
-          await fetch('/api/payments/fail', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ orderId: orderData.orderId }),
-          });
-          onPaymentFailed(
-            failRes.error?.description || 'Payment failed. Dubara try karein.',
-            orderData.orderId,
-          );
-        });
-
-        rzp.open();
-        setSubmitting(false);
-        return;
-      }
-
-      // Sandbox test checkout when RAZORPAY_KEY_ID is not yet configured
-      setSandboxOrder(orderData);
+      setUpiOrder(orderData);
       setSubmitting(false);
     } catch {
       setFormError('Network error. Internet check karke dobara try karein.');
@@ -285,7 +200,7 @@ export function CheckoutView({
               Get Your Diet Plan
             </h1>
             <p className="text-sm text-[#5C544E] mb-6">
-              Apni details bharo aur Razorpay par secure payment karo.
+              Apni details bharo, unique UPI QR scan karo aur payment status automatically verify hoga.
             </p>
 
             <form onSubmit={handleCheckoutSubmit} noValidate className="space-y-4">
@@ -514,8 +429,9 @@ export function CheckoutView({
                   className="mt-0.5 accent-[#F47716]"
                 />
                 <span>
-                  Main samajhta hoon ki yeh ek digital goal-based guide PDF hai (no refund policy)
-                  aur meri details sirf order delivery aur WhatsApp support ke liye use hongi.
+                  Main samajhta/samajhti hoon ki meri age, gender, height, current weight aur diet
+                  preference ka use mere liye personalized diet PDF aur portion guidance banane,
+                  order/payment verification aur support ke liye hoga. Yeh medical prescription nahi hai.
                 </span>
               </label>
 
@@ -537,43 +453,30 @@ export function CheckoutView({
         </div>
       </motion.div>
 
-      {sandboxOrder && (
-        <SandboxRazorpayModal
-          open={Boolean(sandboxOrder)}
-          orderId={sandboxOrder.orderId}
-          razorpayOrderId={sandboxOrder.razorpayOrderId}
-          productName={sandboxOrder.productName}
-          amountInr={Math.round(sandboxOrder.amountPaise / 100)}
+      {upiOrder && (
+        <UpiAutoPaymentModal
+          key={upiOrder.orderId}
+          open={Boolean(upiOrder)}
+          orderId={upiOrder.orderId}
+          productName={upiOrder.productName}
+          amountInr={upiOrder.amountPaise / 100}
           customerName={name.trim()}
           customerPhone={phone.trim()}
-          onSuccessVerify={async ({ razorpayPaymentId, razorpaySignature, method }) => {
-            await verifyWithBackend({
-              orderId: sandboxOrder.orderId,
-              razorpayOrderId: sandboxOrder.razorpayOrderId,
-              razorpayPaymentId,
-              razorpaySignature,
-              method,
-            });
-          }}
-          onFailPayment={async (reason) => {
-            await fetch('/api/payments/fail', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ orderId: sandboxOrder.orderId }),
-            });
-            const failedOrderId = sandboxOrder.orderId;
-            setSandboxOrder(null);
-            onPaymentFailed(reason, failedOrderId);
-          }}
+          upiId={upiOrder.upiId}
+          upiUri={upiOrder.upiUri}
+          qrCodeUrl={upiOrder.qrCodeUrl}
+          appLinks={upiOrder.appLinks}
+          expiresAt={upiOrder.expiresAt}
+          onVerified={handleUpiVerified}
           onDismiss={async () => {
             await fetch('/api/payments/fail', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ orderId: sandboxOrder.orderId }),
-            });
-            const cancelledOrderId = sandboxOrder.orderId;
-            setSandboxOrder(null);
-            onPaymentFailed('Payment cancel kiya gaya. Aap dubara try kar sakte ho.', cancelledOrderId);
+              body: JSON.stringify({ orderId: upiOrder.orderId }),
+            }).catch(() => undefined);
+            const cancelledOrderId = upiOrder.orderId;
+            setUpiOrder(null);
+            onPaymentFailed('Payment window band kar diya gaya. Agar payment deduct hua hai, toh status support ke saath verify karwayen.', cancelledOrderId);
           }}
         />
       )}

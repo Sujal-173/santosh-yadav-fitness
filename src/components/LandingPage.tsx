@@ -664,7 +664,7 @@ export function LandingPage({
                   step: '3',
                   icon: CreditCard,
                   title: 'Make Payment',
-                  desc: `Secure Razorpay (₹${activePriceInr})`,
+                  desc: `Secure UPI Auto QR (₹${activePriceInr})`,
                 },
                 {
                   step: '4',

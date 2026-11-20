@@ -39,20 +39,30 @@ export interface SiteConfigDto {
 export interface PublicConfigResponse {
   siteConfig: SiteConfigDto;
   products: ProductDto[];
-  razorpay: {
-    keyId: string | null;
-    mode: 'razorpay' | 'test-sandbox' | 'unconfigured';
+  upiAuto: {
+    configured: boolean;
+    upiId: string | null;
+    expiryMinutes: number;
   };
 }
 
 export interface OrderCreateResponse {
   orderId: string;
-  razorpayOrderId: string;
   amountPaise: number;
   currency: 'INR';
   productName: string;
-  keyId: string | null;
-  mode: 'razorpay' | 'test-sandbox';
+  upiUri: string;
+  qrCodeUrl: string;
+  upiId: string;
+  appLinks: {
+    gpay: string;
+    phonepe: string;
+    paytm: string;
+    bhim: string;
+  };
+  expiresAt: string;
+  expiryMinutes: number;
+  mode: 'upi-auto';
 }
 
 export interface PaymentVerifiedState {

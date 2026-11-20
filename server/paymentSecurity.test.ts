@@ -1,188 +1,81 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { OrderRecord, PaymentRecord } from './store';
-import {
-  createRazorpayOrder,
-  createSignatureForOrderPayment,
-  isLocalTestPaymentSandboxEnabled,
-  verifyCapturedStatusWithRazorpay,
-  verifyRazorpayPaymentSignature,
-} from './razorpayService';
 import { hasVerifiedCapturedPayment, isVerifiedCapturedPayment } from './paymentSecurity';
 
-const ENV_KEYS = [
-  'NODE_ENV',
-  'APP_URL',
-  'ENABLE_LOCAL_TEST_PAYMENT_SANDBOX',
-  'RAZORPAY_KEY_ID',
-  'RAZORPAY_KEY_SECRET',
-];
-const runtimeEnv = process.env as Record<string, string | undefined>;
+const upiOrder: OrderRecord = {
+  id: 'SYF0123456789ABCDEF012345',
+  customerName: 'Test Buyer',
+  customerPhone: '9876543210',
+  productId: 'fatloss',
+  productName: 'Fat Loss Diet Plan',
+  gateway: 'upi_auto',
+  gatewayOrderId: 'SYF0123456789ABCDEF012345',
+  gatewayMerchantId: 'PAYTM-MID-123',
+  amountPaise: 19900,
+  currency: 'INR',
+  paymentStatus: 'paid',
+  orderStatus: 'completed',
+  expiresAt: new Date(Date.now() + 60000).toISOString(),
+  createdAt: new Date().toISOString(),
+};
 
-async function withEnv(
-  values: Record<string, string | undefined>,
-  run: () => void | Promise<void>,
-): Promise<void> {
-  const previous = Object.fromEntries(ENV_KEYS.map((key) => [key, runtimeEnv[key]]));
-  for (const [key, value] of Object.entries(values)) {
-    if (value === undefined) delete runtimeEnv[key];
-    else runtimeEnv[key] = value;
-  }
+const capturedUpiPayment: PaymentRecord = {
+  id: 'pay_1',
+  gateway: 'upi_auto',
+  gatewayOrderId: upiOrder.gatewayOrderId,
+  upiTransactionId: '202611201234567890',
+  orderId: upiOrder.id,
+  amountPaise: 19900,
+  currency: 'INR',
+  method: 'UPI',
+  status: 'captured',
+  captured: true,
+  gatewayVerified: true,
+  createdAt: new Date().toISOString(),
+};
 
-  try {
-    await run();
-  } finally {
-    for (const key of ENV_KEYS) {
-      const value = previous[key];
-      if (value === undefined) delete runtimeEnv[key];
-      else runtimeEnv[key] = value;
-    }
-  }
-}
+test('UPI download access requires a matching server-verified Paytm transaction', () => {
+  assert.equal(isVerifiedCapturedPayment(upiOrder, capturedUpiPayment), true);
+  assert.equal(hasVerifiedCapturedPayment(upiOrder, [capturedUpiPayment]), true);
+  assert.equal(isVerifiedCapturedPayment({ ...upiOrder, paymentStatus: 'pending' }, capturedUpiPayment), false);
+  assert.equal(isVerifiedCapturedPayment(upiOrder, { ...capturedUpiPayment, captured: false }), false);
+  assert.equal(isVerifiedCapturedPayment(upiOrder, { ...capturedUpiPayment, gatewayVerified: false }), false);
+  assert.equal(isVerifiedCapturedPayment(upiOrder, { ...capturedUpiPayment, status: 'failed' }), false);
+  assert.equal(isVerifiedCapturedPayment(upiOrder, { ...capturedUpiPayment, orderId: 'another-order' }), false);
+  assert.equal(isVerifiedCapturedPayment(upiOrder, { ...capturedUpiPayment, gatewayOrderId: 'another-order' }), false);
+  assert.equal(isVerifiedCapturedPayment(upiOrder, { ...capturedUpiPayment, upiTransactionId: '' }), false);
+  assert.equal(isVerifiedCapturedPayment(upiOrder, { ...capturedUpiPayment, amountPaise: 1 }), false);
+});
 
-test('download authorization requires a verified captured payment for the same order', () => {
-  const order: OrderRecord = {
-    id: 'SYF1234567890ABCDEF123456',
-    customerName: 'Test Buyer',
+test('historical Razorpay orders keep access only when their old signature verification is intact', () => {
+  const legacyOrder: OrderRecord = {
+    id: 'SYF-LEGACY-1234',
+    customerName: 'Legacy Buyer',
     customerPhone: '9876543210',
-    productId: 'fatloss',
-    productName: 'Fat Loss Diet Plan',
-    razorpayOrderId: 'order_test_123',
+    productId: 'gain',
+    productName: 'Weight Gain Diet Plan',
+    razorpayOrderId: 'order_legacy_123',
     amountPaise: 19900,
     currency: 'INR',
     paymentStatus: 'paid',
     orderStatus: 'completed',
     createdAt: new Date().toISOString(),
   };
-  const payment: PaymentRecord = {
-    id: 'pay_1',
-    razorpayPaymentId: 'pay_test_123',
-    razorpayOrderId: order.razorpayOrderId,
-    orderId: order.id,
-    amountPaise: order.amountPaise,
+  const legacyPayment: PaymentRecord = {
+    id: 'pay_legacy',
+    razorpayPaymentId: 'pay_legacy_123',
+    razorpayOrderId: 'order_legacy_123',
+    orderId: legacyOrder.id,
+    amountPaise: 19900,
     currency: 'INR',
-    method: 'test',
+    method: 'upi',
     status: 'captured',
     captured: true,
     signatureVerified: true,
     createdAt: new Date().toISOString(),
   };
 
-  assert.equal(isVerifiedCapturedPayment(order, payment), true);
-  assert.equal(hasVerifiedCapturedPayment(order, [payment]), true);
-  assert.equal(isVerifiedCapturedPayment({ ...order, paymentStatus: 'pending' }, payment), false);
-  assert.equal(isVerifiedCapturedPayment(order, { ...payment, captured: false }), false);
-  assert.equal(isVerifiedCapturedPayment(order, { ...payment, signatureVerified: false }), false);
-  assert.equal(isVerifiedCapturedPayment(order, { ...payment, status: 'failed' }), false);
-  assert.equal(isVerifiedCapturedPayment(order, { ...payment, orderId: 'another-order' }), false);
-  assert.equal(isVerifiedCapturedPayment(order, { ...payment, razorpayOrderId: 'another-order' }), false);
-  assert.equal(isVerifiedCapturedPayment(order, { ...payment, amountPaise: 1 }), false);
-  assert.equal(isVerifiedCapturedPayment(order, { ...payment, razorpayPaymentId: '' }), false);
-});
-
-test('simulated payments require explicit localhost development opt-in', async () => {
-  await withEnv(
-    {
-      NODE_ENV: 'development',
-      APP_URL: 'http://localhost:3000',
-      ENABLE_LOCAL_TEST_PAYMENT_SANDBOX: undefined,
-      RAZORPAY_KEY_ID: undefined,
-      RAZORPAY_KEY_SECRET: undefined,
-    },
-    async () => {
-      assert.equal(isLocalTestPaymentSandboxEnabled(), false);
-      await assert.rejects(
-        createRazorpayOrder({ amountPaise: 19900, receipt: 'test', notes: {} }),
-        /Razorpay credentials are required/,
-      );
-
-      runtimeEnv.ENABLE_LOCAL_TEST_PAYMENT_SANDBOX = 'true';
-      assert.equal(isLocalTestPaymentSandboxEnabled(), true);
-      const order = await createRazorpayOrder({
-        amountPaise: 19900,
-        receipt: 'test',
-        notes: {},
-      });
-      assert.equal(order.mode, 'test-sandbox');
-      assert.match(order.razorpayOrderId, /^order_test_/);
-
-      runtimeEnv.NODE_ENV = 'production';
-      assert.equal(isLocalTestPaymentSandboxEnabled(), false);
-      runtimeEnv.NODE_ENV = 'development';
-      runtimeEnv.APP_URL = 'https://public.example';
-      assert.equal(isLocalTestPaymentSandboxEnabled(), false);
-    },
-  );
-});
-
-test('payment signatures are rejected without a secret and bind the order ID', async () => {
-  await withEnv(
-    {
-      NODE_ENV: 'development',
-      APP_URL: 'http://localhost:3000',
-      ENABLE_LOCAL_TEST_PAYMENT_SANDBOX: 'true',
-      RAZORPAY_KEY_ID: undefined,
-      RAZORPAY_KEY_SECRET: undefined,
-    },
-    () => {
-      const signature = createSignatureForOrderPayment('order_test_1', 'pay_test_1');
-      assert.equal(
-        verifyRazorpayPaymentSignature('order_test_1', 'pay_test_1', signature),
-        true,
-      );
-      assert.equal(
-        verifyRazorpayPaymentSignature('order_test_2', 'pay_test_1', signature),
-        false,
-      );
-      runtimeEnv.ENABLE_LOCAL_TEST_PAYMENT_SANDBOX = 'false';
-      assert.equal(
-        verifyRazorpayPaymentSignature('order_test_1', 'pay_test_1', signature),
-        false,
-      );
-    },
-  );
-});
-
-test('captured status must match Razorpay order, amount, and INR currency', async () => {
-  await withEnv(
-    {
-      NODE_ENV: 'test',
-      APP_URL: 'https://public.example',
-      ENABLE_LOCAL_TEST_PAYMENT_SANDBOX: 'false',
-      RAZORPAY_KEY_ID: 'rzp_test_key',
-      RAZORPAY_KEY_SECRET: 'test-secret',
-    },
-    async () => {
-      const originalFetch = globalThis.fetch;
-      globalThis.fetch = async () =>
-        new Response(
-          JSON.stringify({
-            status: 'captured',
-            captured: true,
-            amount: 19900,
-            currency: 'INR',
-            order_id: 'order_expected',
-            method: 'upi',
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } },
-        );
-
-      try {
-        assert.deepEqual(
-          await verifyCapturedStatusWithRazorpay('pay_test_1', 19900, 'order_expected'),
-          { captured: true, method: 'upi' },
-        );
-        assert.equal(
-          (await verifyCapturedStatusWithRazorpay('pay_test_1', 19900, 'order_other')).captured,
-          false,
-        );
-        assert.equal(
-          (await verifyCapturedStatusWithRazorpay('pay_test_1', 20000, 'order_expected')).captured,
-          false,
-        );
-      } finally {
-        globalThis.fetch = originalFetch;
-      }
-    },
-  );
+  assert.equal(hasVerifiedCapturedPayment(legacyOrder, [legacyPayment]), true);
+  assert.equal(hasVerifiedCapturedPayment(legacyOrder, [{ ...legacyPayment, signatureVerified: false }]), false);
 });

@@ -2,15 +2,11 @@ import { useEffect, useState } from 'react';
 import {
   AlertTriangle,
   ArrowRight,
-  Building2,
   CheckCircle2,
-  CreditCard,
   Download,
-  Lock,
-  ShieldCheck,
-  Smartphone,
-  Wallet,
   X,
+  Copy,
+  RefreshCw,
 } from 'lucide-react';
 import { GENERATED_IMAGES, SAMPLE_MEAL_SCHEDULE } from '../data/siteData';
 import type { GoalSlug, LeadPrefillProfile } from '../types';
@@ -332,7 +328,7 @@ export function RecoverPdfModal({ open, onClose }: RecoverPdfModalProps) {
         Lost Your PDF Link?
       </h3>
       <p className="text-sm text-[#5C544E] mb-4">
-        Apna Order ID (ya Razorpay Payment ID) aur registered 10-digit WhatsApp number daalkar
+        Apna Order ID (ya UPI Transaction ID) aur registered 10-digit WhatsApp number daalkar
         naya secure download link paayein.
       </p>
 
@@ -394,171 +390,287 @@ export function RecoverPdfModal({ open, onClose }: RecoverPdfModalProps) {
   );
 }
 
-interface SandboxRazorpayModalProps {
+interface UpiAutoPaymentModalProps {
   open: boolean;
   orderId: string;
-  razorpayOrderId: string;
   productName: string;
   amountInr: number;
   customerName: string;
   customerPhone: string;
-  onSuccessVerify: (payload: {
-    razorpayPaymentId: string;
-    razorpaySignature: string;
-    method: string;
-  }) => Promise<void>;
-  onFailPayment: (reason: string) => void;
+  upiId: string;
+  upiUri: string;
+  qrCodeUrl: string;
+  appLinks: {
+    gpay: string;
+    phonepe: string;
+    paytm: string;
+    bhim: string;
+  };
+  expiresAt: string;
+  onVerified: (payload: {
+    orderId: string;
+    paymentId: string;
+    productId: GoalSlug;
+    productName: string;
+    downloadToken: string;
+  }) => void;
   onDismiss: () => void;
 }
 
-export function SandboxRazorpayModal({
+export function UpiAutoPaymentModal({
   open,
   orderId,
-  razorpayOrderId,
   productName,
   amountInr,
   customerName,
   customerPhone,
-  onSuccessVerify,
-  onFailPayment,
+  upiId,
+  upiUri,
+  qrCodeUrl,
+  appLinks,
+  expiresAt,
+  onVerified,
   onDismiss,
-}: SandboxRazorpayModalProps) {
-  const [selectedMethod, setSelectedMethod] = useState<'upi' | 'card' | 'netbanking' | 'wallet'>('upi');
-  const [submitting, setSubmitting] = useState(false);
-  const [localErr, setLocalErr] = useState('');
+}: UpiAutoPaymentModalProps) {
+  const [secondsLeft, setSecondsLeft] = useState(() =>
+    Math.max(0, Math.floor((Date.parse(expiresAt) - Date.now()) / 1000)),
+  );
+  const [checking, setChecking] = useState(false);
+  const [status, setStatus] = useState<'pending' | 'failed' | 'expired' | 'review'>('pending');
+  const [message, setMessage] = useState('Scan the QR with any UPI app. Payment confirmation is automatic.');
+  const [copied, setCopied] = useState(false);
 
-  const handleConfirmTestSuccess = async () => {
-    setSubmitting(true);
-    setLocalErr('');
-    try {
-      const res = await fetch('/api/payments/sandbox-sign', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ razorpayOrderId }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setLocalErr(data.error || 'Sandbox signing failed');
-        setSubmitting(false);
-        return;
+  useEffect(() => {
+    if (!open) return;
+    const timer = setInterval(() => {
+      setSecondsLeft(Math.max(0, Math.floor((Date.parse(expiresAt) - Date.now()) / 1000)));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [open, expiresAt]);
+
+  useEffect(() => {
+    if (!open || (status !== 'pending' && status !== 'expired')) return;
+    let active = true;
+    let inFlight = false;
+
+    const checkStatus = async () => {
+      if (!active || inFlight) return;
+      inFlight = true;
+      setChecking(true);
+      try {
+        const res = await fetch('/api/payments/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ orderId: orderId.trim() }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!active) return;
+
+        if (res.ok && data.verified) {
+          setMessage('Payment confirmed by Paytm. Preparing your download...');
+          onVerified({
+            orderId: data.orderId,
+            paymentId: data.paymentId,
+            productId: data.productId,
+            productName: data.productName,
+            downloadToken: data.downloadToken,
+          });
+          return;
+        }
+
+        if (data.status === 'failed' || data.status === 'expired' || data.status === 'review'
+          || res.status === 400 || res.status === 404) {
+          setStatus(data.status === 'failed' || data.status === 'expired' ? data.status : 'review');
+          setMessage(data.error || 'The order could not be verified. Do not pay again; contact support with your order ID.');
+          return;
+        }
+
+        // Paytm's status endpoint returns `message` for pending transactions.
+        setMessage(data.message || data.error || 'Payment abhi confirm nahi hua. We will check again automatically.');
+      } catch {
+        if (active) setMessage('Connection issue. Payment status check will retry automatically.');
+      } finally {
+        inFlight = false;
+        if (active) setChecking(false);
       }
-      await onSuccessVerify({
-        razorpayPaymentId: data.razorpayPaymentId,
-        razorpaySignature: data.razorpaySignature,
-        method: selectedMethod,
-      });
+    };
+
+    void checkStatus();
+    const poller = setInterval(() => {
+      void checkStatus();
+    }, 5000);
+
+    return () => {
+      active = false;
+      clearInterval(poller);
+    };
+  }, [open, orderId, status, onVerified]);
+
+  const minutes = String(Math.floor(secondsLeft / 60)).padStart(2, '0');
+  const seconds = String(secondsLeft % 60).padStart(2, '0');
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(upiId);
+      setCopied(true);
     } catch {
-      setLocalErr('Network error verifying test payment.');
-      setSubmitting(false);
+      setMessage('Copy not available in this browser. You can select the UPI ID manually.');
     }
   };
 
   return (
     <ModalTransition
       open={open}
-      ariaLabelledBy="sandbox-rzp-title"
-      backdropClassName="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
-      panelClassName="w-full max-w-md bg-white text-[#211A15] rounded-2xl overflow-hidden shadow-2xl border border-black/15"
+      onClose={onDismiss}
+      ariaLabelledBy="upi-auto-payment-title"
+      backdropClassName="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-3 sm:p-4"
+      panelClassName="relative w-full max-w-lg max-h-[94vh] overflow-y-auto bg-white text-[#211A15] rounded-2xl shadow-2xl border border-black/15"
     >
-        {/* Razorpay Header */}
-        <div className="bg-[#072654] text-white px-5 py-4 flex items-center justify-between">
-          <div>
-            <div className="text-xs text-blue-200 uppercase tracking-wider font-semibold">
-              Razorpay Test Sandbox
+      <div className="bg-[#141719] text-white px-5 py-4 flex items-start justify-between gap-3">
+        <div>
+          <p className="text-[10px] text-[#F47716] uppercase tracking-[0.2em] font-bold">UPI Auto Checkout</p>
+          <h2 id="upi-auto-payment-title" className="text-lg font-bold mt-1">Complete Your Payment</h2>
+          <p className="text-xs text-[#BDB5AD] mt-0.5">{productName} · Order #{orderId}</p>
+        </div>
+        <div className="text-right shrink-0">
+          <p className="text-xl font-extrabold tabular-nums">₹{amountInr.toFixed(2)}</p>
+          <button type="button" onClick={onDismiss} className="text-[11px] text-[#BDB5AD] underline mt-1">Close</button>
+        </div>
+      </div>
+
+      <div className="p-5 space-y-4">
+        <div className="bg-[#FAF6F0] border border-black/8 rounded-lg p-3 text-xs text-[#5C544E]">
+          Paying as <strong className="text-[#211A15]">{customerName}</strong> · {customerPhone}
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-[1fr_1fr] gap-4 items-center">
+          <div className="flex flex-col items-center">
+            <div className="bg-white border border-black/10 rounded-xl p-3 shadow-sm">
+              <img
+                src={qrCodeUrl}
+                alt={`UPI payment QR for ₹${amountInr.toFixed(2)}`}
+                width={220}
+                height={220}
+                className="w-[190px] h-[190px] sm:w-[210px] sm:h-[210px] object-contain"
+                referrerPolicy="no-referrer"
+              />
             </div>
-            <h3 id="sandbox-rzp-title" className="text-base font-bold">
-              Santosh Yadav Fitness
-            </h3>
-            <p className="text-xs text-blue-100">
-              {productName} · Order #{orderId}
+            <p className="text-[11px] text-[#7A7169] mt-2">Scan using any UPI app</p>
+          </div>
+
+          <div className="space-y-3">
+            <div>
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-[#7A7169] mb-1">Pay to UPI ID</p>
+              <div className="flex items-center gap-2 rounded-lg border border-black/10 px-3 py-2">
+                <span className="text-sm font-bold break-all flex-1">{upiId}</span>
+                <button type="button" onClick={handleCopy} aria-label="Copy UPI ID" className="shrink-0 p-1.5 rounded-md hover:bg-black/5">
+                  <Copy className="w-4 h-4" />
+                </button>
+              </div>
+              {copied && <p className="text-[10px] text-emerald-700 mt-1">UPI ID copied</p>}
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              {[
+                { label: 'Google Pay', href: appLinks.gpay },
+                { label: 'PhonePe', href: appLinks.phonepe },
+                { label: 'Paytm', href: appLinks.paytm },
+                { label: 'BHIM / Other UPI', href: appLinks.bhim },
+              ].map((app) => (
+                <a
+                  key={app.label}
+                  href={app.href}
+                  className="text-center text-[11px] font-semibold rounded-lg border border-[#F47716]/30 bg-[#FFF7EF] text-[#7C3D0A] hover:bg-[#FCE8D6] px-2 py-2.5"
+                >
+                  {app.label}
+                </a>
+              ))}
+            </div>
+            <a href={upiUri} className="block text-center text-xs font-semibold text-[#C65E0A] underline">
+              Open UPI app
+            </a>
+          </div>
+        </div>
+
+        <div className="rounded-xl border border-black/10 px-4 py-3 flex items-center justify-between gap-3">
+          <div>
+            <p className="text-[10px] uppercase tracking-wide font-semibold text-[#7A7169]">QR expires in</p>
+            <p className={`text-lg font-extrabold tabular-nums ${secondsLeft === 0 ? 'text-red-600' : 'text-[#211A15]'}`}>
+              {minutes}:{seconds}
             </p>
           </div>
           <div className="text-right">
-            <div className="text-xl font-extrabold tabular-nums">₹{amountInr}</div>
-            <button
-              type="button"
-              onClick={onDismiss}
-              aria-label="Cancel checkout"
-              className="text-xs text-blue-200 hover:text-white underline mt-0.5 cursor-pointer"
-            >
-              Cancel
-            </button>
+            <p className="text-[11px] font-semibold text-[#5C544E]">Payment status</p>
+            <p className={`text-xs font-bold uppercase ${status === 'pending' ? 'text-amber-700' : status === 'failed' || status === 'expired' ? 'text-red-600' : 'text-orange-700'}`}>
+              {status === 'pending' ? (secondsLeft === 0 ? 'Checking delayed payment' : 'Waiting for payment') : status === 'review' ? 'Needs support' : status}
+            </p>
           </div>
         </div>
 
-        <div className="p-5 space-y-4">
-          <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 flex items-start gap-2.5 text-xs text-amber-900">
-            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" aria-hidden="true" />
-            <span>
-              <strong>Test Mode Active:</strong> Live Razorpay keys abhi `.env` mein set nahi
-              hain. Yeh modal real HMAC SHA-256 server signature verification &amp; token flow test
-              karne ke liye hai.
-            </span>
-          </div>
-
-          <div className="text-xs text-[#5C544E] bg-[#FAF7F3] rounded-lg px-3.5 py-2.5 border border-black/8">
-            Paying as <strong className="text-[#211A15]">{customerName}</strong> ({customerPhone})
-          </div>
-
-          <div className="space-y-2">
-            {(
-              [
-                { id: 'upi', label: 'UPI (GPay, PhonePe, Paytm)', icon: Smartphone },
-                { id: 'card', label: 'Credit / Debit Card', icon: CreditCard },
-                { id: 'netbanking', label: 'Net Banking', icon: Building2 },
-                { id: 'wallet', label: 'Wallets', icon: Wallet },
-              ] as const
-            ).map((opt) => {
-              const Icon = opt.icon;
-              const active = selectedMethod === opt.id;
-              return (
-                <button
-                  key={opt.id}
-                  type="button"
-                  onClick={() => setSelectedMethod(opt.id)}
-                  className={`w-full px-3.5 py-2.5 rounded-lg border text-left flex items-center gap-3 text-sm font-medium cursor-pointer transition-colors ${
-                    active
-                      ? 'border-[#072654] bg-blue-50/70 text-[#072654]'
-                      : 'border-black/10 hover:border-black/25'
-                  }`}
-                >
-                  <Icon className="w-4 h-4 shrink-0" aria-hidden="true" />
-                  <span>{opt.label}</span>
-                </button>
-              );
-            })}
-          </div>
-
-          {localErr && <p className="text-xs text-red-600">{localErr}</p>}
-
-          <div className="space-y-2 pt-1">
-            <button
-              type="button"
-              disabled={submitting}
-              onClick={handleConfirmTestSuccess}
-              className="w-full py-3 px-4 bg-[#F47716] hover:bg-[#FF9A32] text-white font-semibold text-sm rounded-lg transition-colors flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
-            >
-              <ShieldCheck className="w-4 h-4" aria-hidden="true" />
-              <span>
-                {submitting ? 'Verifying Signature...' : `Pay ₹${amountInr} (Test Success)`}
-              </span>
-            </button>
-
-            <button
-              type="button"
-              disabled={submitting}
-              onClick={() => onFailPayment('Test payment failed or declined by user.')}
-              className="w-full py-2 px-4 border border-red-200 text-red-700 hover:bg-red-50 text-xs font-semibold rounded-lg transition-colors cursor-pointer"
-            >
-              Simulate Payment Failure
-            </button>
-          </div>
-
-          <div className="flex items-center justify-center gap-1.5 text-[11px] text-[#7A7169]">
-            <Lock className="w-3 h-3" aria-hidden="true" />
-            <span>Server-verified HMAC SHA-256 · Razorpay Order {razorpayOrderId}</span>
-          </div>
+        <div className={`rounded-lg border p-3 text-xs leading-relaxed ${
+          status === 'failed' || status === 'expired'
+            ? 'bg-red-50 border-red-200 text-red-800'
+            : status === 'review'
+              ? 'bg-orange-50 border-orange-200 text-orange-900'
+              : 'bg-amber-50 border-amber-200 text-amber-900'
+        }`} aria-live="polite">
+          {message}
         </div>
+
+        {status === 'pending' || status === 'expired' ? (
+          <button
+            type="button"
+            disabled={checking}
+            onClick={async () => {
+              setStatus('pending');
+              setChecking(true);
+              try {
+                const res = await fetch('/api/payments/verify', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ orderId: orderId.trim() }),
+                });
+                const data = await res.json().catch(() => ({}));
+                if (res.ok && data.verified) {
+                  onVerified({
+                    orderId: data.orderId,
+                    paymentId: data.paymentId,
+                    productId: data.productId,
+                    productName: data.productName,
+                    downloadToken: data.downloadToken,
+                  });
+                } else if (['failed', 'expired', 'review'].includes(data.status)
+                  || res.status === 400 || res.status === 404) {
+                  setStatus(data.status === 'failed' || data.status === 'expired' ? data.status : 'review');
+                  setMessage(data.error || 'The order could not be verified. Do not pay again; contact support with your order ID.');
+                } else {
+                  setMessage(data.message || data.error || 'Payment is still pending. Keep this window open.');
+                }
+              } catch {
+                setMessage('Could not check right now. Automatic retry is still enabled.');
+              } finally {
+                setChecking(false);
+              }
+            }}
+            className="w-full py-3 px-4 bg-[#F47716] hover:bg-[#FF9A32] text-white font-semibold text-sm rounded-lg transition-colors inline-flex items-center justify-center gap-2 disabled:opacity-60"
+          >
+            <RefreshCw className={`w-4 h-4 ${checking ? 'animate-spin' : ''}`} />
+            {checking ? 'Checking with Paytm…' : 'I Have Paid — Check Status'}
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={onDismiss}
+            className="w-full py-3 px-4 border border-black/15 hover:bg-black/5 text-[#211A15] font-semibold text-sm rounded-lg"
+          >
+            Close payment window
+          </button>
+        )}
+
+        <p className="text-[10px] text-center text-[#8B827A] leading-relaxed">
+          Never share your UPI PIN or OTP. Your PDF unlocks only after the server receives a matching Paytm success status and exact amount for this order.
+        </p>
+      </div>
     </ModalTransition>
   );
 }

@@ -107,7 +107,7 @@ export const FAQS: FaqItem[] = [
     id: 'faq-1',
     question: 'Plan kis format mein milega?',
     answer:
-      'Plan aapko instant downloadable PDF format mein milega. Razorpay payment verify hone ke turant baad isi website par aapka secure Download button activate ho jaayega.',
+      'Plan aapko instant downloadable PDF format mein milega. UPI payment server par confirm hote hi isi website par aapka secure Download button activate ho jaayega.',
   },
   {
     id: 'faq-2',
@@ -119,13 +119,13 @@ export const FAQS: FaqItem[] = [
     id: 'faq-3',
     question: 'Payment ke kaun se options hain?',
     answer:
-      'Aap UPI (GPay, PhonePe, Paytm, BHIM), Debit/Credit Card, Net Banking ya Wallets ke through Razorpay ke 100% secure checkout par ₹199 pay kar sakte ho.',
+      'Aap Google Pay, PhonePe, Paytm ya kisi bhi supported UPI app se order ke liye generate hua unique QR scan karke checkout par dikhayi gayi price pay kar sakte ho.',
   },
   {
     id: 'faq-4',
     question: 'Payment kaise karna hai?',
     answer:
-      'Bas apna goal (Fat Loss ya Weight Gain) select karein, naam aur WhatsApp number daalein aur "Pay Securely" par click karein. Razorpay checkout khulega jahan aap apna preferred method choose kar sakte hain.',
+      'Bas apna goal (Fat Loss ya Weight Gain) select karein, naam aur WhatsApp number daalein aur "Proceed to Pay" par click karein. Aapke order ke liye unique UPI QR generate hoga; payment server par automatically check hoga.',
   },
   {
     id: 'faq-5',
@@ -143,7 +143,7 @@ export const FAQS: FaqItem[] = [
     id: 'faq-7',
     question: 'Payment fail ho gaya toh kya karein?',
     answer:
-      'Agar aapke bank se paise kat gaye aur screen par failure dikha, toh ghabrayein nahi. Razorpay webhooks automatically status update karte hain, ya aap apna Order ID aur phone number WhatsApp par bhej kar turant verification kara sakte hain.',
+      'Agar aapke bank se paise kat gaye lekin status pending hai, toh QR window khuli rakhein. Server Paytm transaction status automatically check karega. Order ID aur registered mobile number support par share karke manual help bhi le sakte hain.',
   },
   {
     id: 'faq-8',

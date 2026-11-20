@@ -1,15 +1,4 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import type { GoalSlug } from './store';
-import { get, put } from '@vercel/blob';
-
-const PRIVATE_PDF_DIR = path.resolve(process.cwd(), 'private-pdfs');
-
-function ensurePrivateDir(): void {
-  if (!fs.existsSync(PRIVATE_PDF_DIR)) {
-    fs.mkdirSync(PRIVATE_PDF_DIR, { recursive: true });
-  }
-}
+import type { GoalSlug, OrderRecord } from './store';
 
 function escapePdfText(input: string): string {
   return input
@@ -78,7 +67,28 @@ function assemblePdf(pagesContent: string[]): Buffer {
   return Buffer.from(pdf, 'utf8');
 }
 
-function buildGoalPdfBuffer(goal: GoalSlug): Buffer {
+type DietProfile = Pick<OrderRecord, 'customerName' | 'id' | 'age' | 'gender' | 'heightCm' | 'weightKg' | 'dietPreference'>;
+
+function calculateNutrition(profile: DietProfile, goal: GoalSlug) {
+  const age = Number(profile.age || 25);
+  const weight = Number(profile.weightKg || 65);
+  const height = Number(profile.heightCm || 165);
+  const gender = profile.gender || 'Other';
+  const bmi = weight / Math.pow(height / 100, 2);
+  // Mifflin-St Jeor estimate. For "Other", use the midpoint rather than
+  // silently assigning a sex-specific coefficient. These are estimates only.
+  const base = 10 * weight + 6.25 * height - 5 * age;
+  const bmr = gender === 'Male' ? base + 5 : gender === 'Female' ? base - 161 : base - 78;
+  const maintenance = bmr * 1.2; // sedentary baseline; activity level is not collected yet
+  const calories = age < 18 ? null : Math.round(goal === 'fatloss'
+    ? Math.max(gender === 'Female' ? 1200 : 1500, maintenance - 350)
+    : maintenance + 250);
+  const bmiLabel = age < 18 ? 'Adult BMI categories are not used for under-18 profiles' : bmi < 18.5 ? 'Below standard adult range' : bmi < 25 ? 'Standard adult range' : bmi < 30 ? 'Above standard adult range' : 'High adult BMI range';
+  const portionScale = Math.max(0.75, Math.min(1.3, (calories || (goal === 'fatloss' ? 1600 : 2300)) / (goal === 'fatloss' ? 1600 : 2300)));
+  return { bmi: bmi.toFixed(1), bmiLabel, calories, portionScale };
+}
+
+function buildGoalPdfBuffer(goal: GoalSlug, profile: DietProfile): Buffer {
   const isFatLoss = goal === 'fatloss';
   const title = isFatLoss ? 'FAT LOSS DIET PLAN' : 'WEIGHT GAIN DIET PLAN';
   const subtitle = isFatLoss
@@ -92,37 +102,49 @@ function buildGoalPdfBuffer(goal: GoalSlug): Buffer {
   p1.push(`BT /F2 24 Tf 1 1 1 rg 42 776 Td (${escapePdfText(title)}) Tj ET`);
   p1.push(`BT /F1 10.5 Tf 0.84 0.81 0.78 rg 42 750 Td (${escapePdfText(subtitle)}) Tj ET`);
 
-  p1.push('0.96 0.92 0.87 rg 42 630 511 74 re f');
-  p1.push('BT /F2 11 Tf 0.13 0.10 0.08 rg 56 684 Td (GUIDE OVERVIEW & GENERAL NUTRITION NOTICE) Tj ET');
-  const noteLines = wrapText(
-    'Yeh ek goal-based Indian diet guide hai jo ghar ke simple khaane par based hai. Koi medical diagnosis nahi hai; kisi bhi bimari ya allergy mein doctor se salah lein.',
-    88,
-  );
-  let ny = 665;
-  for (const line of noteLines) {
-    p1.push(`BT /F1 9.5 Tf 0.30 0.25 0.22 rg 56 ${ny} Td (${escapePdfText(line)}) Tj ET`);
-    ny -= 14;
+  const nutrition = calculateNutrition(profile, goal);
+  p1.push('0.96 0.92 0.87 rg 42 625 511 79 re f');
+  p1.push('BT /F2 11 Tf 0.13 0.10 0.08 rg 56 687 Td (YOUR PERSONAL DIET PROFILE) Tj ET');
+  const profileLines = [
+    `Name: ${String(profile.customerName || 'Customer').slice(0, 24)}   Order: ${String(profile.id || '').slice(-10)}`,
+    `Age: ${profile.age} years   Gender: ${profile.gender}   Diet: ${profile.dietPreference}`,
+    `Height: ${profile.heightCm} cm   Current weight: ${profile.weightKg} kg   BMI: ${nutrition.bmi}`,
+    `BMI category (adult reference): ${nutrition.bmiLabel}`,
+    nutrition.calories ? `Estimated energy starting point: ${nutrition.calories} kcal/day (sedentary baseline)` : 'Under 18: calorie and protein targets require parent/guardian and qualified dietitian review.',
+  ];
+  let ny = 671;
+  for (const line of profileLines) {
+    for (const wrapped of wrapText(line, 92)) {
+      p1.push(`BT /F1 8.5 Tf 0.30 0.25 0.22 rg 56 ${ny} Td (${escapePdfText(wrapped)}) Tj ET`);
+      ny -= 11;
+    }
   }
 
-  p1.push('BT /F2 13 Tf 0.13 0.10 0.08 rg 42 598 Td (DAILY MEAL SCHEDULE (HINGLISH EDITION)) Tj ET');
+  p1.push('BT /F2 13 Tf 0.13 0.10 0.08 rg 42 598 Td (YOUR DAILY MEAL SCHEDULE) Tj ET');
   p1.push('0.85 0.80 0.75 RG 0.8 w 42 590 m 553 590 l S');
 
+  const scale = nutrition.portionScale;
+  const qty = (value: number, step = 1) => String(Math.max(step, Math.round((value * scale) / step) * step));
+  const vegetarian = profile.dietPreference === 'Vegetarian';
+  const eggetarian = profile.dietPreference === 'Eggetarian';
+  const proteinChoice = vegetarian ? 'paneer/tofu/soya' : eggetarian ? 'eggs/paneer' : 'chicken/fish/eggs';
+  const breakfastProtein = vegetarian ? 'paneer bhurji' : eggetarian ? 'egg bhurji ya paneer' : 'egg bhurji';
   const meals = isFatLoss
     ? [
-        ['07:00 AM - Morning Start', '500ml gunguna paani + 5 bheege badam. Chai/coffee bina cheeni.'],
-        ['08:30 AM - Breakfast', '2 Moong dal chilla pudina chutney ke saath + 150g low-fat dahi (Swap: 3 egg whites + 2 multigrain bread).'],
-        ['11:30 AM - Mid-Morning', '1 Seasonal fruit (apple/guava) + 1 glass chaas roasted jeera ke saath.'],
-        ['01:30 PM - Lunch (Ghar ka)', '2 Whole wheat roti + 1 katori dal + 100g paneer/chicken + kachumber salad.'],
-        ['05:00 PM - Pre-Workout', '1 Black coffee + 30g roasted makhana ya 1 chhota kela.'],
-        ['08:00 PM - Dinner', '50g boiled soya chunks ya 120g grilled paneer/chicken + 1 roti + hari sabzi.'],
+        ['07:00 AM - Morning Start', 'Paani + 4-5 bheege badam. Chai/coffee bina ya kam cheeni.'],
+        ['08:30 AM - Breakfast', `${qty(2)} moong dal chilla + ${qty(100, 5)}g dahi. Protein option: ${proteinChoice}.`],
+        ['11:30 AM - Mid-Morning', '1 seasonal fruit (apple/guava/orange) + chaas.'],
+        ['01:30 PM - Lunch', `${qty(2)} roti + ${qty(1)} katori dal + ${qty(100, 5)}g ${proteinChoice} + salad aur sabzi.`],
+        ['05:00 PM - Evening Snack', `${qty(25, 5)}g roasted chana/makhana ya 1 fruit; workout ho toh timing adjust karein.`],
+        ['08:00 PM - Dinner', `${qty(1)}-${qty(2)} roti + ${qty(100, 5)}g ${proteinChoice} + seasonal sabzi/salad.`],
       ]
     : [
-        ['07:00 AM - Morning Start', '500ml paani + 1 kela + 8 bheege badam aur 4 kaju.'],
-        ['08:30 AM - Breakfast', '80g oats 300ml full-cream doodh mein + 2 uble ande ya 75g paneer bhurji.'],
-        ['11:30 AM - Mid-Morning Shake', '300ml doodh + 1 kela + 2 tbsp peanut butter shake.'],
-        ['01:30 PM - Lunch (Ghar ka)', '3 Roti + 150g chawal + 1.5 katori dal/rajma + 150g paneer/chicken sabzi + dahi.'],
-        ['05:00 PM - Pre-Workout', '2 Uble aalu (150g) sendha namak ke saath + 1 kela.'],
-        ['08:30 PM - Dinner', '2-3 Roti + 100g chawal + 150g paneer/egg curry + salad.'],
+        ['07:00 AM - Morning Start', 'Paani + 1 kela + 6-8 bheege badam.'],
+        ['08:30 AM - Breakfast', `${qty(70, 5)}g oats doodh ke saath + ${qty(2)} eggs equivalent ${breakfastProtein}.` ],
+        ['11:30 AM - Mid-Morning Shake', `${qty(250, 25)}ml doodh + 1 kela + 1 tbsp peanut butter (allergy na ho toh).`],
+        ['01:30 PM - Lunch', `${qty(3)} roti + ${qty(1)} katori chawal + dal/rajma + ${qty(120, 5)}g ${proteinChoice} + dahi.`],
+        ['05:00 PM - Evening Snack', 'Boiled aloo/sweet potato + dahi ya roasted chana.'],
+        ['08:30 PM - Dinner', `${qty(2)}-${qty(3)} roti + chawal + ${qty(120, 5)}g ${proteinChoice} + sabzi.`],
       ];
 
   let y = 564;
@@ -145,10 +167,15 @@ function buildGoalPdfBuffer(goal: GoalSlug): Buffer {
   p2.push('BT /F2 16 Tf 1 1 1 rg 42 800 Td (FOOD SWAP LIST, MEAL TIMINGS & COMMON MISTAKES) Tj ET');
   p2.push('BT /F1 10 Tf 0.82 0.79 0.76 rg 42 782 Td (Consistency banao, mehengi supplements ki zarurat nahi hai) Tj ET');
 
+  const proteinSwapList = vegetarian
+    ? 'Paneer | Tofu | Soya chunks | Moong dal | Chana | Thick homemade dahi.'
+    : eggetarian
+      ? 'Whole eggs | Egg whites | Paneer | Soya chunks | Moong dal | Thick homemade dahi.'
+      : 'Chicken | Fish | Whole eggs | Egg whites | Paneer | Dal and chana.';
   const blocks = [
     [
-      '1. BUDGET-FRIENDLY INDIAN PROTEIN SWAPS',
-      'Paneer (100g) | Soya Chunks (50g raw) | Whole Eggs & Egg Whites | Moong Dal + Chana | Thick Homemade Dahi.',
+      '1. PROTEIN OPTIONS BASED ON YOUR FOOD PREFERENCE',
+      proteinSwapList,
     ],
     [
       '2. MEAL TIMING TIPS',
@@ -160,7 +187,7 @@ function buildGoalPdfBuffer(goal: GoalSlug): Buffer {
     ],
     [
       '4. SUPPORT & DISCLAIMER',
-      'Yeh PDF sirf general educational information ke liye hai. Koi sawaal ho toh humare WhatsApp support par apna Order ID bhej kar pooch sakte hain.',
+      'Yeh plan aapke diye gaye age, gender, height, weight aur diet preference ke basis par portion guidance adjust karta hai. Energy estimate sedentary activity assumption par hai kyunki activity level checkout mein nahi poocha gaya; meal quantities practical starting portions hain, exact calorie prescription nahi. Calories/BMI estimates medical advice nahi hain. Allergy, diabetes, kidney/liver condition, pregnancy, eating disorder, medicines, ya age 18 se kam hone par qualified doctor/dietitian se personalized review karayein. Koi sawaal ho toh WhatsApp support par Order ID bhejein.',
     ],
   ];
 
@@ -180,77 +207,7 @@ function buildGoalPdfBuffer(goal: GoalSlug): Buffer {
   return assemblePdf([p1.join('\n'), p2.join('\n')]);
 }
 
-async function streamToBuffer(stream: ReadableStream<Uint8Array>): Promise<Buffer> {
-  const reader = stream.getReader();
-  const chunks: Buffer[] = [];
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) chunks.push(Buffer.from(value));
-  }
-  return Buffer.concat(chunks);
-}
-
-export async function isPrivatePdfReady(filename: string): Promise<boolean> {
-  const safeName = path.basename(filename);
-  if (process.env.BLOB_READ_WRITE_TOKEN) {
-    const existing = await get(safeName, { access: 'private' });
-    if (!existing || existing.statusCode !== 200) return false;
-    // The readiness check only needs metadata. Cancel the response stream instead
-    // of leaving an unread Blob stream open in a warm serverless invocation.
-    await existing.stream?.cancel().catch(() => undefined);
-    return true;
-  }
-  if (process.env.NODE_ENV === 'production') return false;
-  ensurePrivateDir();
-  return true;
-}
-
-export async function getOrCreatePrivatePdf(goal: GoalSlug, filename: string): Promise<Buffer> {
-  const safeName = path.basename(filename);
-  if (process.env.BLOB_READ_WRITE_TOKEN) {
-    const existing = await get(safeName, { access: 'private' });
-    if (existing && existing.statusCode === 200 && existing.stream) {
-      return streamToBuffer(existing.stream);
-    }
-    if (process.env.NODE_ENV === 'production') {
-      throw new Error(`Approved PDF is missing from private Blob storage: ${safeName}. Upload it in Admin before accepting orders.`);
-    }
-    const generated = buildGoalPdfBuffer(goal);
-    await put(safeName, generated, {
-      access: 'private',
-      addRandomSuffix: false,
-      allowOverwrite: true,
-      contentType: 'application/pdf',
-    });
-    return generated;
-  }
-
-  if (process.env.NODE_ENV === 'production') {
-    throw new Error('BLOB_READ_WRITE_TOKEN is required for private PDF storage on Vercel.');
-  }
-  ensurePrivateDir();
-  const fullPath = path.join(PRIVATE_PDF_DIR, safeName);
-  if (fs.existsSync(fullPath)) return fs.readFileSync(fullPath);
-  const generated = buildGoalPdfBuffer(goal);
-  fs.writeFileSync(fullPath, generated);
-  return generated;
-}
-
-export async function saveUploadedPrivatePdf(filename: string, data: Buffer): Promise<void> {
-  const safeName = path.basename(filename);
-  if (process.env.BLOB_READ_WRITE_TOKEN) {
-    await put(safeName, data, {
-      access: 'private',
-      addRandomSuffix: false,
-      allowOverwrite: true,
-      contentType: 'application/pdf',
-    });
-    return;
-  }
-  if (process.env.NODE_ENV === 'production') {
-    throw new Error('BLOB_READ_WRITE_TOKEN is required for private PDF storage on Vercel.');
-  }
-  ensurePrivateDir();
-  fs.writeFileSync(path.join(PRIVATE_PDF_DIR, safeName), data);
+export async function getOrCreatePrivatePdf(goal: GoalSlug, profile: DietProfile): Promise<Buffer> {
+  // Shared content template; render a fresh PDF from the paid order's stored profile.
+  return buildGoalPdfBuffer(goal, profile);
 }
